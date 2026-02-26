@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import functools
 import os
+from contextlib import nullcontext
 from importlib.util import find_spec
 from typing import Final
 
@@ -216,18 +217,28 @@ class ConchLinearKernel(MPLinearKernel):
 
         w_q, w_s, w_zp, _ = self._get_weight_params(layer)
 
-        _current_m_dim = x.shape[0]
-        _current_n_dim = w_q.shape[1]
+        M = x.shape[0]
+        K = x.shape[1]
+        N = w_q.shape[1]
 
-        output = mixed_precision_gemm(
-            x=x,
-            w_q_packed=w_q.data,
-            w_s=w_s.data,
-            w_zp=w_zp.data if w_zp is not None else None,
-            weight_size_bits=self.config.weight_type.size_bits,
-            weight_bias=self.config.weight_type.bias,
-            group_size=self.config.group_size,
+        _current_m_dim = M
+        _current_n_dim = N
+
+        ctx = (
+            nullcontext()
+            if torch.compiler.is_compiling()
+            else torch.profiler.record_function(f"conch_gemm {M}x{N}x{K}")
         )
+        with ctx:
+            output = mixed_precision_gemm(
+                x=x,
+                w_q_packed=w_q.data,
+                w_s=w_s.data,
+                w_zp=w_zp.data if w_zp is not None else None,
+                weight_size_bits=self.config.weight_type.size_bits,
+                weight_bias=self.config.weight_type.bias,
+                group_size=self.config.group_size,
+            )
 
         if bias is not None:
             output.add_(bias)  # In-place add

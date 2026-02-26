@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -548,19 +549,35 @@ def _awq_gemm(
             )
 
             # Get actual K dimension (may be less than qweight K if padded)
+            M = input.shape[0]
             K = input.shape[-1]
+            N = qweight.shape[1] * 8
             # Pass output_k to avoid allocating/computing padded values
             weight_t = awq_dequantize_triton_transposed(
                 qweight, scales, qzeros, output_k=K
             )
             # TN GEMM: input[M,K] @ weight_t[N,K].T → output[M,N]
-            return torch.mm(input, weight_t.T)
+            ctx = (
+                nullcontext()
+                if torch.compiler.is_compiling()
+                else torch.profiler.record_function(f"BLAS {M}x{N}x{K}")
+            )
+            with ctx:
+                return torch.mm(input, weight_t.T)
 
         # NN path (default for non-ROCm or when TN disabled)
         # Pass output_k to avoid computing padded rows
+        M = input.shape[0]
         K = input.shape[-1]
+        N = qweight.shape[1] * 8
         out = awq_dequantize(qweight, scales, qzeros, 0, 0, 0, output_k=K)
-        return torch.matmul(input, out)
+        ctx = (
+            nullcontext()
+            if torch.compiler.is_compiling()
+            else torch.profiler.record_function(f"BLAS {M}x{N}x{K}")
+        )
+        with ctx:
+            return torch.matmul(input, out)
 
     if envs.VLLM_USE_TRITON_AWQ:
         from vllm.model_executor.layers.quantization.awq_triton import awq_gemm_triton
