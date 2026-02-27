@@ -72,13 +72,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install build wheel setuptools setuptools-scm ninja cmake packaging jinja2
 
-      - name: Install PyTorch and ROCm SDK from nightly
+      - name: Install PyTorch, ROCm SDK and build deps
         run: |
-          # Install PyTorch with ROCm
-          pip install torch torchvision --index-url ${{ env.PYTORCH_INDEX_URL }}
+          # Install from rocm-build.txt (pins torch==2.10.0 etc.)
+          # Use nightly index instead of the default ROCm test index in the file
+          pip install -r requirements/rocm-build.txt \
+            --extra-index-url ${{ env.PYTORCH_INDEX_URL }}
           
           # Install ROCm SDK with devel and libraries extras
-          pip install "rocm[devel,libraries]" --index-url ${{ env.PYTORCH_INDEX_URL }} || \
+          pip install "rocm[devel,libraries]" --extra-index-url ${{ env.PYTORCH_INDEX_URL }} || \
             echo "Warning: Could not install rocm[devel,libraries]"
           
           # Initialize ROCm SDK (creates symlinks, etc.)
@@ -123,11 +125,10 @@ jobs:
           which hipcc || echo "hipcc not found in PATH"
           cat $(which hipcc) 2>/dev/null | head -50 || true
 
-      - name: Install vLLM build requirements
+      - name: Install remaining vLLM build requirements
         run: |
-          # Use ROCm index to avoid overwriting ROCm torch with CUDA torch from PyPI
+          # build.txt has additional deps not in rocm-build.txt (e.g. grpcio-tools)
           pip install -r requirements/build.txt --extra-index-url ${{ env.PYTORCH_INDEX_URL }}
-          pip install -r requirements/common.txt --extra-index-url ${{ env.PYTORCH_INDEX_URL }}
 
       - name: Build wheel
         env:
