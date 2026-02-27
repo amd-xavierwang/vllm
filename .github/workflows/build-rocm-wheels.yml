@@ -187,183 +187,13 @@ jobs:
           path: gh-pages/
           retention-days: 90
 
-  publish-to-gh-pages:
-    needs: build-wheel
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pages: write
-    
-    steps:
-      - name: Checkout gh-pages branch
-        uses: actions/checkout@v4
-        with:
-          ref: gh-pages
-          path: gh-pages-existing
-        continue-on-error: true
-
-      - name: Download wheel artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: vllm-rocm-wheel
-          path: new-wheels/
-
-      - name: Download index artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: wheel-index
-          path: new-index/
-
-      - name: Prepare gh-pages content
-        run: |
-          # Create wheels directory structure
-          mkdir -p gh-pages/wheels
-          
-          # Copy existing wheels if gh-pages branch exists
-          if [ -d "gh-pages-existing/wheels" ]; then
-            cp -r gh-pages-existing/wheels/* gh-pages/wheels/ 2>/dev/null || true
-          fi
-          
-          # Copy new wheels
-          cp new-wheels/*.whl gh-pages/wheels/
-          
-          # List all wheels and regenerate index
-          ls -la gh-pages/wheels/
-
-      - name: Regenerate complete index
-        run: |
-          pip install packaging
-          
-          cat > /tmp/generate_index.py << 'EOF'
-          import os
-          import sys
-          from pathlib import Path
-          from datetime import datetime
-          from urllib.parse import quote
-          
-          INDEX_HTML_TEMPLATE = """<!DOCTYPE html>
-          <html>
-            <head>
-              <meta name="pypi:repository-version" content="1.0">
-              <title>ROCm Wheels</title>
-              <style>
-                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
-                       max-width: 800px; margin: 40px auto; padding: 0 20px; }}
-                code {{ background: #f4f4f4; padding: 2px 6px; border-radius: 3px; }}
-                pre {{ background: #f4f4f4; padding: 12px; border-radius: 6px; overflow-x: auto; }}
-                a {{ color: #0366d6; }}
-              </style>
-            </head>
-            <body>
-              <h1>ROCm Wheels</h1>
-              <p>Pre-built wheels for AMD ROCm (gfx11 / Strix Halo / RDNA3+)</p>
-              <p><em>Generated: {timestamp}</em></p>
-              
-              <h2>Installation</h2>
-              <p><strong>Step 1:</strong> Install ROCm PyTorch first:</p>
-              <pre>pip install torch --index-url https://rocm.nightlies.amd.com/v2-staging/gfx1151</pre>
-              
-              <p><strong>Step 2:</strong> Install packages:</p>
-              <pre>pip install vllm flash-attn --extra-index-url {base_url}</pre>
-              
-              <h2>Available Packages</h2>
-          {items}
-            </body>
-          </html>
-          """
-          
-          PACKAGE_INDEX_TEMPLATE = """<!DOCTYPE html>
-          <html>
-            <head>
-              <meta name="pypi:repository-version" content="1.0">
-              <title>{package_name}</title>
-            </head>
-            <body>
-          {items}
-            </body>
-          </html>
-          """
-          
-          def parse_wheel_name(filename):
-              """Extract package name from wheel filename."""
-              # Format: {package}-{version}-{python}-{abi}-{platform}.whl
-              base = filename.removesuffix(".whl")
-              parts = base.split("-")
-              # Package name is everything before the version
-              # Handle packages with dashes by finding where version starts
-              for i, part in enumerate(parts):
-                  if part[0].isdigit():
-                      return "-".join(parts[:i]).replace("_", "-")
-              return parts[0].replace("_", "-")
-          
-          wheels_dir = Path("gh-pages/wheels")
-          wheels_dir.mkdir(parents=True, exist_ok=True)
-          
-          # Find all wheel files
-          wheel_files = list(wheels_dir.glob("*.whl"))
-          
-          # Group wheels by package name
-          packages = {}
-          for whl in wheel_files:
-              pkg_name = parse_wheel_name(whl.name)
-              if pkg_name not in packages:
-                  packages[pkg_name] = []
-              packages[pkg_name].append(whl.name)
-          
-          print(f"Found {len(wheel_files)} wheels in {len(packages)} packages")
-          for pkg, wheels in packages.items():
-              print(f"  {pkg}: {len(wheels)} wheels")
-          
-          # Generate package directories and indices
-          for pkg_name, wheel_names in packages.items():
-              pkg_dir = wheels_dir / pkg_name
-              pkg_dir.mkdir(exist_ok=True)
-              
-              # Generate wheel links
-              wheel_links = []
-              for whl_name in sorted(wheel_names, reverse=True):
-                  encoded = quote(whl_name, safe="")
-                  wheel_links.append(f'    <a href="../{encoded}">{whl_name}</a><br/>')
-              
-              package_index = PACKAGE_INDEX_TEMPLATE.format(
-                  package_name=pkg_name,
-                  items="\n".join(wheel_links)
-              )
-              (pkg_dir / "index.html").write_text(package_index)
-          
-          # Generate top-level index
-          base_url = os.environ.get("BASE_URL", "https://example.github.io/vllm/wheels")
-          package_links = "\n".join(
-              f'    <a href="{pkg}/">{pkg}</a><br/>' 
-              for pkg in sorted(packages.keys())
-          )
-          
-          top_index = INDEX_HTML_TEMPLATE.format(
-              timestamp=datetime.now().isoformat(),
-              base_url=base_url,
-              items=package_links
-          )
-          (wheels_dir / "index.html").write_text(top_index)
-          
-          print(f"Generated index with {len(packages)} packages")
-          EOF
-          
-          BASE_URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/wheels" \
-            python /tmp/generate_index.py
-
-      - name: Deploy to gh-pages
-        uses: peaceiris/actions-gh-pages@v4
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./gh-pages
-          keep_files: true
-
   create-release:
     needs: build-wheel
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
+    outputs:
+      release_tag: ${{ steps.create-tag.outputs.tag }}
     
     steps:
       - name: Download wheel artifact
@@ -372,28 +202,164 @@ jobs:
           name: vllm-rocm-wheel
           path: dist/
 
+      - name: Determine release tag
+        id: create-tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${{ github.ref_name }}"
+          else
+            WHEEL=$(ls dist/*.whl | head -1)
+            BASENAME=$(basename "$WHEEL" .whl)
+            # Extract version from wheel name: vllm-<version>-cp312-...
+            VERSION=$(echo "$BASENAME" | sed 's/^vllm-//; s/-cp[0-9].*//')
+            TAG="rocm-${VERSION}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.create-tag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           files: dist/*.whl
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
           body: |
             ## vLLM ROCm Wheel
             
-            Built for ROCm architecture: `${{ env.PYTORCH_ROCM_ARCH }}`
+            Built for ROCm architectures: `${{ env.PYTORCH_ROCM_ARCH }}`
             
             ### Installation
-            
-            **Option 1: Direct wheel install**
             ```bash
-            pip install ${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}/<wheel-filename>.whl
-            ```
-            
-            **Option 2: Using extra index URL**
-            ```bash
+            pip install torch --extra-index-url https://rocm.nightlies.amd.com/v2-staging/gfx1151
             pip install vllm --extra-index-url https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/wheels
             ```
-            
-            **Note:** You also need ROCm PyTorch. Install it first:
-            ```bash
-            pip install torch --index-url ${{ env.PYTORCH_INDEX_URL }}
-            ```
+
+  publish-to-gh-pages:
+    needs: create-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+    
+    steps:
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: vllm-rocm-wheel
+          path: new-wheels/
+
+      - name: Generate index pointing to GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE_URL: "https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/wheels"
+          RELEASE_TAG: ${{ needs.create-release.outputs.release_tag }}
+        run: |
+          pip install packaging
+
+          cat > /tmp/generate_index.py << 'PYEOF'
+          import os, json, subprocess
+          from pathlib import Path
+          from datetime import datetime
+          from urllib.parse import quote
+
+          REPO = os.environ["REPO"]
+          BASE_URL = os.environ["BASE_URL"]
+          RELEASE_TAG = os.environ.get("RELEASE_TAG", "latest")
+
+          PACKAGE_INDEX_TEMPLATE = """<!DOCTYPE html>
+          <html>
+            <head><meta name="pypi:repository-version" content="1.0"><title>{package_name}</title></head>
+            <body>
+          {items}
+            </body>
+          </html>
+          """
+
+          def parse_wheel_name(filename):
+              base = filename.removesuffix(".whl")
+              parts = base.split("-")
+              for i, part in enumerate(parts):
+                  if part[0].isdigit():
+                      return "-".join(parts[:i]).replace("_", "-")
+              return parts[0].replace("_", "-")
+
+          # Collect wheels from all GitHub Releases
+          result = subprocess.run(
+              ["gh", "release", "list", "--repo", REPO, "--limit", "100", "--json", "tagName"],
+              capture_output=True, text=True
+          )
+          releases = json.loads(result.stdout) if result.returncode == 0 else []
+          print(f"Found {len(releases)} releases")
+
+          wheels = {}  # pkg_name -> [(whl_name, download_url)]
+          for rel in releases:
+              tag = rel["tagName"]
+              result = subprocess.run(
+                  ["gh", "release", "view", tag, "--repo", REPO, "--json", "assets"],
+                  capture_output=True, text=True
+              )
+              if result.returncode != 0:
+                  continue
+              assets = json.loads(result.stdout).get("assets", [])
+              for asset in assets:
+                  name = asset["name"]
+                  url = asset["url"]
+                  if name.endswith(".whl"):
+                      pkg = parse_wheel_name(name)
+                      wheels.setdefault(pkg, []).append((name, url))
+
+          # Include new wheels from this build if not already found in releases
+          new_dir = Path("new-wheels")
+          if new_dir.exists():
+              for whl in new_dir.glob("*.whl"):
+                  pkg = parse_wheel_name(whl.name)
+                  release_names = {w[0] for w in wheels.get(pkg, [])}
+                  if whl.name not in release_names:
+                      url = f"https://github.com/{REPO}/releases/download/{quote(RELEASE_TAG, safe='')}/{quote(whl.name, safe='')}"
+                      wheels.setdefault(pkg, []).append((whl.name, url))
+
+          print(f"Total: {sum(len(v) for v in wheels.values())} wheels in {len(wheels)} packages")
+
+          out = Path("gh-pages/wheels")
+          out.mkdir(parents=True, exist_ok=True)
+
+          for pkg_name, whl_list in wheels.items():
+              pkg_dir = out / pkg_name
+              pkg_dir.mkdir(exist_ok=True)
+              links = []
+              for whl_name, url in sorted(whl_list, key=lambda x: x[0], reverse=True):
+                  links.append(f'    <a href="{url}">{whl_name}</a><br/>')
+              (pkg_dir / "index.html").write_text(
+                  PACKAGE_INDEX_TEMPLATE.format(package_name=pkg_name, items="\n".join(links))
+              )
+
+          top_index = f"""<!DOCTYPE html>
+          <html>
+            <head><meta name="pypi:repository-version" content="1.0"><title>ROCm Wheels</title></head>
+            <body>
+              <h1>ROCm Wheels</h1>
+              <p>Pre-built wheels for AMD ROCm (gfx11 / Strix Halo / RDNA3+)</p>
+              <p><em>Generated: {datetime.now().isoformat()}</em></p>
+              <h2>Installation</h2>
+              <pre>pip install torch --extra-index-url https://rocm.nightlies.amd.com/v2-staging/gfx1151
+          pip install vllm --extra-index-url {BASE_URL}</pre>
+              <h2>Available Packages</h2>
+          """
+          for p in sorted(wheels):
+              top_index += f'    <a href="{p}/">{p}</a><br/>\n'
+          top_index += "  </body>\n</html>"
+          (out / "index.html").write_text(top_index)
+          print("Index generated successfully")
+          PYEOF
+
+          python /tmp/generate_index.py
+
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./gh-pages/wheels
+          destination_dir: wheels
+          keep_files: false
