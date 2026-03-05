@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from contextlib import nullcontext
+
 import torch
 
 from vllm.triton_utils import tl, triton
@@ -136,6 +138,16 @@ def scaled_mm_kernel(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
+# Tuned tile configs for gfx11 (RDNA3) decode (M<=32).
+# Keyed by (N, K) -> (BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K).
+_gfx11_decode_tile_config: dict[tuple[int, int], tuple[int, int, int]] = {
+    (5120, 3072): (128, 32, 256),  # qkv_proj
+    (3072, 3072): (64, 64, 128),  # o_proj
+    (16384, 3072): (128, 32, 256),  # gate_up_proj
+    (3072, 8192): (16, 32, 256),  # down_proj
+}
+
+
 # input   - [M, K]
 # weight - [K, N]
 def triton_scaled_mm(
@@ -177,9 +189,21 @@ def triton_scaled_mm(
     has_scalar = lambda x: x.shape[0] == 1 and x.shape[1] == 1
 
     if use_heuristic:
+        from vllm.platforms import current_platform
+
         is_small_N = N < 8192
         next_power_of_2_M = max(32, triton.next_power_of_2(M))
-        if next_power_of_2_M <= 32:
+        gfx11_tile = None
+
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_gfx11
+
+            if on_gfx11() and next_power_of_2_M <= 32:
+                gfx11_tile = _gfx11_decode_tile_config.get((N, K), (128, 32, 256))
+
+        if gfx11_tile is not None:
+            tile_shape = gfx11_tile
+        elif next_power_of_2_M <= 32:
             tile_shape = (64, 64, 256) if is_small_N else (64, 128, 256)
         elif next_power_of_2_M <= 64:
             tile_shape = (64, 64, 256)
@@ -195,30 +219,44 @@ def triton_scaled_mm(
 
     accumulator_dtype = tl.float32 if input.is_floating_point() else tl.int32
 
-    # A = input, B = weight, C = result
-    # A = M x K, B = K x N, C = M x N
-    scaled_mm_kernel[grid](
-        input,
-        weight,
-        scale_a,
-        scale_b,
-        result,
-        bias,
-        M,
-        N,
-        K,
-        input.stride(0),
-        input.stride(1),
-        weight.stride(0),
-        weight.stride(1),
-        result.stride(0),
-        result.stride(1),
-        accumulator_dtype,
-        BLOCK_SIZE_M=block_size_m,
-        BLOCK_SIZE_N=block_size_n,
-        BLOCK_SIZE_K=block_size_k,
-        BLOCK_SIZE_SCALE_A=block_size_sa,
-        BLOCK_SIZE_SCALE_B=block_size_sb,
+    _rf_label = (
+        f"triton_scaled_mm {M}x{N}x{K}"
+        f" in={input.dtype} out={out_dtype} sc={scale_a.dtype}"
+        f" sa={scale_a.shape[0]}x{scale_a.shape[1]}"
+        f" sb={scale_b.shape[0]}x{scale_b.shape[1]}"
+        f" BM={block_size_m} BN={block_size_n} BK={block_size_k}"
+        f" stride_a={input.stride(0)},{input.stride(1)}"
+        f" stride_b={weight.stride(0)},{weight.stride(1)}"
+        f" stride_c={result.stride(0)},{result.stride(1)}"
     )
+    ctx = (
+        nullcontext()
+        if torch.compiler.is_compiling()
+        else torch.profiler.record_function(_rf_label)
+    )
+    with ctx:
+        scaled_mm_kernel[grid](
+            input,
+            weight,
+            scale_a,
+            scale_b,
+            result,
+            bias,
+            M,
+            N,
+            K,
+            input.stride(0),
+            input.stride(1),
+            weight.stride(0),
+            weight.stride(1),
+            result.stride(0),
+            result.stride(1),
+            accumulator_dtype,
+            BLOCK_SIZE_M=block_size_m,
+            BLOCK_SIZE_N=block_size_n,
+            BLOCK_SIZE_K=block_size_k,
+            BLOCK_SIZE_SCALE_A=block_size_sa,
+            BLOCK_SIZE_SCALE_B=block_size_sb,
+        )
 
     return result.to(out_dtype)
