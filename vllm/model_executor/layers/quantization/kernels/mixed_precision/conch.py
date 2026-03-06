@@ -229,6 +229,10 @@ class ConchLinearKernel(MPLinearKernel):
         _current_m_dim = M
         _current_n_dim = N
 
+        group_size = self.config.group_size
+        if group_size == -1:
+            group_size = K
+
         ctx = (
             nullcontext()
             if torch.compiler.is_compiling()
@@ -242,7 +246,7 @@ class ConchLinearKernel(MPLinearKernel):
                 w_zp=w_zp.data if w_zp is not None else None,
                 weight_size_bits=self.config.weight_type.size_bits,
                 weight_bias=self.config.weight_type.bias,
-                group_size=self.config.group_size,
+                group_size=group_size,
             )
 
         if bias is not None:

@@ -64,6 +64,13 @@ class ExllamaLinearKernel(MPLinearKernel):
                 f"{cls.SUPPORTED_QUANT_TYPES}",
             )
 
+        if c.group_size <= 0:
+            return (
+                False,
+                f"Exllama does not support channel-wise quantization "
+                f"(group_size={c.group_size})",
+            )
+
         if c.full_weight_shape[0] % c.group_size != 0:
             return (
                 False,
