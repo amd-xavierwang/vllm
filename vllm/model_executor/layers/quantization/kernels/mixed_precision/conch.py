@@ -236,7 +236,9 @@ class ConchLinearKernel(MPLinearKernel):
         ctx = (
             nullcontext()
             if torch.compiler.is_compiling()
-            else torch.profiler.record_function(f"conch_gemm {M}x{N}x{K}")
+            else torch.profiler.record_function(
+                f"conch_gemm {M}x{N}x{K} w{self.config.weight_type.size_bits}"
+            )
         )
         with ctx:
             output = mixed_precision_gemm(

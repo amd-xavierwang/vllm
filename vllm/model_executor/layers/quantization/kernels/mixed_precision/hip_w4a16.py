@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from contextlib import nullcontext
+
 import torch
 
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
@@ -14,6 +16,8 @@ from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
 
 class HipW4A16LinearKernel(MPLinearKernel):
+    w_zp_name: str | None
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # 0 means "auto" for awq_gemv_hip; keep default consistent.
@@ -270,11 +274,19 @@ class HipW4A16LinearKernel(MPLinearKernel):
         w_q, w_s, w_zp, _ = self._get_weight_params(layer)
         x_2d = x.reshape(-1, x.shape[-1])
         out_shape = x.shape[:-1] + (self.config.partition_weight_shape[1],)
+        M = x_2d.shape[0]
         K = self.config.partition_weight_shape[0]
+        N = self.config.partition_weight_shape[1]
         split_k = self._split_k
-        output = ops.hip_w4a16_linear_kernel_apply_weights(
-            x_2d, w_q, w_s, w_zp, K, split_k
+        ctx = (
+            nullcontext()
+            if torch.compiler.is_compiling()
+            else torch.profiler.record_function(f"hip_w4a16 {M}x{N}x{K}")
         )
+        with ctx:
+            output = ops.hip_w4a16_linear_kernel_apply_weights(
+                x_2d, w_q, w_s, w_zp, K, split_k
+            )
 
         if bias is not None:
             output.add_(bias)  # In-place add
