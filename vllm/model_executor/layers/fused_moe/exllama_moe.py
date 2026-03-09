@@ -18,6 +18,7 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
 )
+from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import moe_unpermute
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
@@ -249,10 +250,6 @@ class ExllamaExperts(mk.FusedMoEExpertsModular):
         )
 
         # ---- Reduce via moe_unpermute ----
-        from vllm.model_executor.layers.fused_moe.moe_permute_unpermute import (  # noqa: E501
-            moe_unpermute,
-        )
-
         if block_size_m > 1:
             # Contiguous kernel writes to c[base_row] (block-aligned).
             # Invert sorted_token_ids to map slot → aligned position.
