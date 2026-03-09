@@ -86,6 +86,10 @@ jobs:
           # Initialize ROCm SDK (creates symlinks, etc.)
           rocm-sdk init || echo "Warning: rocm-sdk init failed"
           
+          # Use amdsmi bundled in rocm-sdk-core (not the PyPI package)
+          SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
+          export PYTHONPATH="$SITE_PACKAGES/_rocm_sdk_core/share/amd_smi${PYTHONPATH:+:$PYTHONPATH}"
+          
           # Show what's installed
           pip list | grep -i -E "rocm|torch|sdk" || true
           python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'HIP: {torch.version.hip}'); print(f'CUDA: {torch.version.cuda}')"
@@ -115,10 +119,14 @@ jobs:
           echo "=== HIP_DEVICE_LIB_PATH contents ==="
           ls -la "$HIP_DEVICE_LIB_PATH" 2>/dev/null | head -20 || echo "Warning: HIP_DEVICE_LIB_PATH not found"
           
+          # Use amdsmi bundled in rocm-sdk-core (not the PyPI package)
+          AMDSMI_PATH="$SITE_PACKAGES/_rocm_sdk_core/share/amd_smi"
+          
           # Export to GITHUB_ENV for subsequent steps
           echo "ROCM_PATH=$ROCM_PATH" >> $GITHUB_ENV
           echo "HIP_DEVICE_LIB_PATH=$HIP_DEVICE_LIB_PATH" >> $GITHUB_ENV
           echo "PATH=$ROCM_BIN:$PATH" >> $GITHUB_ENV
+          echo "PYTHONPATH=$AMDSMI_PATH${PYTHONPATH:+:$PYTHONPATH}" >> $GITHUB_ENV
           
           # Verify hipcc is available
           echo "=== Checking hipcc ==="
