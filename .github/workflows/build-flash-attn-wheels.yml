@@ -161,7 +161,7 @@ jobs:
           WHEEL=$(ls dist/*.whl | head -1)
           BASENAME=$(basename "$WHEEL" .whl)
           VERSION=$(echo "$BASENAME" | sed 's/^flash_attn-//; s/-cp[0-9].*//')
-          TAG="flash-attn-${VERSION}"
+          TAG="wheels/flash-attn-${VERSION}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Release tag: $TAG"
 

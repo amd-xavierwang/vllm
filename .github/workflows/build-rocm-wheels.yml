@@ -221,7 +221,7 @@ jobs:
             BASENAME=$(basename "$WHEEL" .whl)
             # Extract version from wheel name: vllm-<version>-cp312-...
             VERSION=$(echo "$BASENAME" | sed 's/^vllm-//; s/-cp[0-9].*//')
-            TAG="rocm-${VERSION}"
+            TAG="wheels/rocm-${VERSION}"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Release tag: $TAG"
