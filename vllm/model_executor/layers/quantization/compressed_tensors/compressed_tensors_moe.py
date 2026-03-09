@@ -41,7 +41,7 @@ from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
     fused_marlin_moe,
 )
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
-    FusedMoEModularKernel,
+    FusedMoEKernel,
 )
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
     convert_to_fp8_moe_kernel_format,
@@ -59,7 +59,7 @@ from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
     select_nvfp4_moe_backend,
 )
 from vllm.model_executor.layers.fused_moe.prepare_finalize import (
-    MoEPrepareAndFinalizeNoEP,
+    MoEPrepareAndFinalizeNoDPEPModular,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (  # noqa
     WNA16_SUPPORTED_BITS,
@@ -1868,11 +1868,11 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             assert self.moe_quant_config is not None
             layer.w13_weight = layer.w13_weight_packed
             layer.w2_weight = layer.w2_weight_packed
-            self.moe_mk = FusedMoEModularKernel(
+            self.moe_mk = FusedMoEKernel(
                 fused_experts=ExllamaExperts(
                     moe_config=self.moe, quant_config=self.moe_quant_config
                 ),
-                prepare_finalize=MoEPrepareAndFinalizeNoEP(),
+                prepare_finalize=MoEPrepareAndFinalizeNoDPEPModular(),
             )
         else:
             # Triton path: transpose + reinterpret as uint8

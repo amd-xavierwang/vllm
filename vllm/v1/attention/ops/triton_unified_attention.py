@@ -15,7 +15,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.batch_invariant import vllm_is_batch_invariant
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-from vllm.utils.platform_utils import get_cu_count
+from vllm.utils.platform_utils import num_compute_units
 
 logger = init_logger(__name__)
 is_batch_invariant = vllm_is_batch_invariant()
@@ -85,7 +85,7 @@ def select_3d_config(
     num_segments_override=None,
 ):
     if current_platform.is_rocm():
-        cu_count = get_cu_count()
+        cu_count = num_compute_units()
         if head_size < 128 or element_size == 1:
             cu_mult = 4
             MIN_SEGMENTS = 8
@@ -157,7 +157,7 @@ def use_2d_kernel(
     element_size,
 ):
     if current_platform.is_rocm():
-        cu_count = get_cu_count()
+        cu_count = num_compute_units()
         cu_mult = 4 if head_size < 128 or element_size == 1 else 2
         if current_platform.is_navi():
             cu_mult = 4
