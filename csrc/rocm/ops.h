@@ -14,6 +14,14 @@ torch::Tensor wvSplitK_int8(const at::Tensor& in_a, const at::Tensor& in_b,
                             const std::optional<at::Tensor>& in_bias,
                             const int64_t CuCount);
 
+torch::Tensor wvSplitK_int8_sweep(const at::Tensor& in_a,
+                                  const at::Tensor& in_b,
+                                  const at::Tensor& in_scale,
+                                  const std::optional<at::Tensor>& in_bias,
+                                  const int64_t CuCount, const int64_t ytile,
+                                  const int64_t unrl, const int64_t achunk,
+                                  const int64_t wvprgrp);
+
 torch::Tensor wvSplitKrc(const at::Tensor& in_a, const at::Tensor& in_b,
                          const std::optional<at::Tensor>& in_bias,
                          const int64_t CuCount);
