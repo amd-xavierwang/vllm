@@ -23,6 +23,9 @@ from vllm.model_executor.layers.quantization.kernels.mixed_precision.exllama imp
 from vllm.model_executor.layers.quantization.kernels.mixed_precision.hip_w4a16 import (  # noqa: E501
     HipW4A16LinearKernel,
 )
+from vllm.model_executor.layers.quantization.kernels.mixed_precision.hip_w8a16 import (  # noqa: E501
+    HipW8A16LinearKernel,
+)
 from vllm.model_executor.layers.quantization.kernels.mixed_precision.machete import (  # noqa: E501
     MacheteLinearKernel,
 )
@@ -49,9 +52,10 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
         ExllamaLinearKernel,
     ],
     PlatformEnum.ROCM: [
-        HipW4A16LinearKernel,
-        ConchLinearKernel,
         ExllamaLinearKernel,
+        HipW8A16LinearKernel,
+        ConchLinearKernel,
+        HipW4A16LinearKernel,
     ],
     PlatformEnum.XPU: [
         XPUwNa16LinearKernel,

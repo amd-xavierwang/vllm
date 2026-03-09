@@ -26,6 +26,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor");
   rocm_ops.impl("wvSplitK", torch::kCUDA, &wvSplitK);
 
+  // W8A16 skinny GEMM: int8 weights, fp16/bf16 activations, per-channel scale
+  rocm_ops.def(
+      "wvSplitK_int8(Tensor in_a, Tensor in_b, Tensor in_scale, "
+      "Tensor? in_bias, int CuCount) -> Tensor");
+  rocm_ops.impl("wvSplitK_int8", torch::kCUDA, &wvSplitK_int8);
+
   // Custom gemm op for skinny matrix-matrix multiplication
   rocm_ops.def(
       "wvSplitKrc(Tensor in_a, Tensor in_b, Tensor? in_bias, int CuCount) -> "
