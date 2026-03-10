@@ -19,7 +19,6 @@ from tests.kernels.utils import torch_experts
 from vllm._custom_ops import gptq_shuffle
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import fused_topk
-from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     int4_w4a16_moe_quant_config,
 )
@@ -213,7 +212,7 @@ def _run_exllama_moe(
                 topk_ids=topk_ids,
                 global_num_experts=e,
                 expert_map=None,
-                activation=MoEActivation.SILU,
+                activation="silu",
             )
     finally:
         if orig_select is not None:
