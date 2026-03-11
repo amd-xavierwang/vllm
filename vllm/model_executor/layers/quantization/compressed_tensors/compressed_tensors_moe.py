@@ -1943,7 +1943,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.moe_mk is not None:
-            return self.moe_mk(
+            return self.moe_mk.apply(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
