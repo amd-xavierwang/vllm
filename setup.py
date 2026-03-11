@@ -870,15 +870,32 @@ def get_nvcc_cuda_version() -> Version:
     return nvcc_cuda_version
 
 
+VLLM_TAG_REGEX = r"^v(?P<version>\d+(?:\.\d+)*(?:[._-]?\w+)*)$"
+VLLM_GIT_DESCRIBE = [
+    "git",
+    "describe",
+    "--dirty",
+    "--tags",
+    "--long",
+    "--abbrev=40",
+    "--match",
+    "v[0-9]*",
+]
+
+
 def get_vllm_version() -> str:
     # Allow overriding the version. This is useful to build platform-specific
     # wheels (e.g. CPU, TPU) without modifying the source.
     if env_version := os.getenv("VLLM_VERSION_OVERRIDE"):
         print(f"Overriding VLLM version with {env_version} from VLLM_VERSION_OVERRIDE")
         os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
-        return get_version(write_to="vllm/_version.py")
+        return get_version(write_to="vllm/_version.py", tag_regex=VLLM_TAG_REGEX)
 
-    version = get_version(write_to="vllm/_version.py")
+    version = get_version(
+        write_to="vllm/_version.py",
+        tag_regex=VLLM_TAG_REGEX,
+        git_describe_command=VLLM_GIT_DESCRIBE,
+    )
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 
     if _no_device():
