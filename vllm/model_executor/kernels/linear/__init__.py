@@ -45,6 +45,9 @@ from vllm.model_executor.kernels.linear.mixed_precision.exllama import (
 from vllm.model_executor.kernels.linear.mixed_precision.hip_w4a16 import (
     HipW4A16LinearKernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.hip_w4a16_skinny import (
+    HipW4A16SkinnyLinearKernel,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.hip_w8a16 import (
     HipW8A16LinearKernel,
 )
@@ -141,8 +144,9 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
         ExllamaLinearKernel,
     ],
     PlatformEnum.ROCM: [
-        ExllamaLinearKernel,
+        HipW4A16SkinnyLinearKernel,
         HipW8A16LinearKernel,
+        ExllamaLinearKernel,
         ConchLinearKernel,
         HipW4A16LinearKernel,
     ],
@@ -401,5 +405,6 @@ __all__ = [
     "ExllamaLinearKernel",
     "MacheteLinearKernel",
     "MarlinLinearKernel",
+    "HipW4A16SkinnyLinearKernel",
     "XPUwNa16LinearKernel",
 ]
