@@ -367,14 +367,12 @@ torch::Tensor wvSplitK_int8(const at::Tensor& in_a, const at::Tensor& in_b,
   else                                          \
     WVSPLITK_INT8_LAUNCH(64, _YTILE, _UNRL, _N)
 
-#define WVSPLIT_INT8_TILE(_sYT, __N)  \
-  {                                   \
-    if (__N == 1 && K_in >= 8192)     \
-      WVSPLITK_INT8(1, 2, __N)        \
-    else if (__N == 4 && _sYT >= 480) \
-      WVSPLITK_INT8(2, 2, __N)        \
-    else                              \
-      WVSPLITK_INT8(1, 4, __N)        \
+#define WVSPLIT_INT8_TILE(_sYT, __N) \
+  {                                  \
+    if (__N >= 4 && _sYT >= 480)     \
+      WVSPLITK_INT8(4, 1, __N)       \
+    else                             \
+      WVSPLITK_INT8(1, 4, __N)       \
   }
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(in_b.scalar_type(), "wvSplitK_int8", [&] {

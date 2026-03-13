@@ -2392,6 +2392,22 @@ def wvSplitK_int4_g(
     return torch.ops._rocm_C.wvSplitK_int4_g(a, b, scale, bias, cu_count, group_size)
 
 
+def wvSplitK_int4g_sweep(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale: torch.Tensor,
+    cu_count: int,
+    group_size: int,
+    ytile: int,
+    unrl: int,
+    achunk: int,
+    wvprgrp: int,
+) -> torch.Tensor:
+    return torch.ops._rocm_C.wvSplitK_int4g_sweep(
+        a, b, scale, cu_count, group_size, ytile, unrl, achunk, wvprgrp
+    )
+
+
 def wvSplitKrc(
     a: torch.Tensor, b: torch.Tensor, cu_count: int, bias: torch.Tensor = None
 ) -> torch.Tensor:

@@ -59,6 +59,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "Tensor? in_bias, int CuCount, int group_size) -> Tensor");
   rocm_ops.impl("wvSplitK_int4_g", torch::kCUDA, &wvSplitK_int4_g);
 
+  rocm_ops.def(
+      "wvSplitK_int4g_sweep(Tensor in_a, Tensor in_b, Tensor in_scale, "
+      "int CuCount, int group_size, int ytile, int unrl, int achunk, "
+      "int wvprgrp) -> Tensor");
+  rocm_ops.impl("wvSplitK_int4g_sweep", torch::kCUDA, &wvSplitK_int4g_sweep);
+
   // Custom gemm op for skinny matrix-matrix multiplication
   rocm_ops.def(
       "wvSplitKrc(Tensor in_a, Tensor in_b, Tensor? in_bias, int CuCount) -> "
