@@ -149,6 +149,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 
   union bigTypeW {
     uint8_t b[A_CHUNK / 2];
+    uint32_t u32[A_CHUNK / 8];
     float f[A_CHUNK / 8];
   };
 
@@ -219,11 +220,39 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
   #pragma unroll
           for (int y = 0; y < YTILE; y++) {
             bigTypeA cvtB;
+
+            if constexpr (std::is_same_v<scalar_t, half>) {
+              constexpr uint32_t FP16_MAGIC = 0x64006400u;
+              constexpr uint32_t BIAS_LO = 0x64086408u;
+              constexpr uint32_t SCALE16 = 0x2C002C00u;
+              constexpr uint32_t BIAS_HI = 0xD480D480u;
   #pragma unroll
-            for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
-              uint8_t p = bigB[y][k2].b[b];
-              cvtB.h[2 * b] = (scalar_t)(((int8_t)((p & 0xF) << 4)) >> 4);
-              cvtB.h[2 * b + 1] = (scalar_t)(((int8_t)(p & 0xF0)) >> 4);
+              for (uint32_t w = 0; w < A_CHUNK / 8; w++) {
+                uint32_t qa = bigB[y][k2].u32[w];
+                uint32_t lo0 = (qa & 0x000F000Fu) | FP16_MAGIC;
+                uint32_t hi0 = (qa & 0x00F000F0u) | FP16_MAGIC;
+                qa >>= 8;
+                uint32_t lo1 = (qa & 0x000F000Fu) | FP16_MAGIC;
+                uint32_t hi1 = (qa & 0x00F000F0u) | FP16_MAGIC;
+
+                *(half2*)&cvtB.f[w * 4 + 0] =
+                    __hsub2(*(half2*)&lo0, *(const half2*)&BIAS_LO);
+                *(half2*)&cvtB.f[w * 4 + 1] =
+                    __hfma2(*(half2*)&hi0, *(const half2*)&SCALE16,
+                            *(const half2*)&BIAS_HI);
+                *(half2*)&cvtB.f[w * 4 + 2] =
+                    __hsub2(*(half2*)&lo1, *(const half2*)&BIAS_LO);
+                *(half2*)&cvtB.f[w * 4 + 3] =
+                    __hfma2(*(half2*)&hi1, *(const half2*)&SCALE16,
+                            *(const half2*)&BIAS_HI);
+              }
+            } else {
+  #pragma unroll
+              for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+                uint8_t p = bigB[y][k2].b[b];
+                cvtB.h[2 * b] = (scalar_t)(((int8_t)((p & 0xF) << 4)) >> 4);
+                cvtB.h[2 * b + 1] = (scalar_t)(((int8_t)(p & 0xF0)) >> 4);
+              }
             }
 
             if constexpr (GROUP_SIZE > 0) {

@@ -63,11 +63,21 @@ LDS_CAPACITY = 64 * 1024 // 2
 
 
 def pack_int4(values_int8):
+    """Pack signed int4 values using ExLlama shuffle for fast fp16 dequant."""
     M, K = values_int8.shape
-    low = values_int8[:, 0::2] & 0xF
-    high = values_int8[:, 1::2] & 0xF
-    packed = (low | (high << 4)).to(torch.uint8)
-    return packed.view(torch.int8).contiguous()
+    unsigned = (values_int8.to(torch.int16) + 8).to(torch.uint8)
+    g = unsigned.view(M, K // 8, 8).to(torch.int32)
+    shuffled = (
+        g[:, :, 0]
+        | (g[:, :, 2] << 4)
+        | (g[:, :, 4] << 8)
+        | (g[:, :, 6] << 12)
+        | (g[:, :, 1] << 16)
+        | (g[:, :, 3] << 20)
+        | (g[:, :, 5] << 24)
+        | (g[:, :, 7] << 28)
+    )
+    return shuffled.contiguous().view(torch.int8).contiguous()
 
 
 def parse_shape(s):
