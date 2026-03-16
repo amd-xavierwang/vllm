@@ -19,15 +19,16 @@ from tests.kernels.utils import torch_experts
 from vllm._custom_ops import gptq_shuffle
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import fused_topk
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     int4_w4a16_moe_quant_config,
 )
 from vllm.model_executor.layers.fused_moe.exllama_moe import ExllamaExperts
 from vllm.model_executor.layers.fused_moe.modular_kernel import (
-    FusedMoEModularKernel,
+    FusedMoEKernelModularImpl,
 )
 from vllm.model_executor.layers.fused_moe.prepare_finalize import (
-    MoEPrepareAndFinalizeNoEP,
+    MoEPrepareAndFinalizeNoDPEPModular,
 )
 from vllm.platforms import current_platform
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -187,9 +188,9 @@ def _run_exllama_moe(
         ExllamaExperts._select_block_size_m = staticmethod(lambda _m, _t, _e: forced)
 
     try:
-        mk = FusedMoEModularKernel(
+        mk = FusedMoEKernelModularImpl(
             fused_experts=experts,
-            prepare_finalize=MoEPrepareAndFinalizeNoEP(),
+            prepare_finalize=MoEPrepareAndFinalizeNoDPEPModular(),
         )
 
         init_workspace_manager(device)
@@ -204,7 +205,7 @@ def _run_exllama_moe(
                 global_num_experts=e,
             )
 
-            exllama_out = mk(
+            exllama_out = mk.apply(
                 hidden_states=hidden,
                 w1=w1_packed,
                 w2=w2_packed,
@@ -212,7 +213,8 @@ def _run_exllama_moe(
                 topk_ids=topk_ids,
                 global_num_experts=e,
                 expert_map=None,
-                activation="silu",
+                activation=MoEActivation.SILU,
+                apply_router_weight_on_input=False,
             )
     finally:
         if orig_select is not None:
