@@ -3,15 +3,15 @@
 
 import pytest
 import torch
-
-import vllm._custom_ops as ops
-from vllm.model_executor.layers.quantization import awq_gemv_config
 from vllm.model_executor.layers.quantization.kernels.mixed_precision.hip_w4a16 import (  # noqa: E501
     HipW4A16LinearKernel,
 )
 from vllm.model_executor.layers.quantization.kernels.mixed_precision.MPLinearKernel import (  # noqa: E501
     MPLinearLayerConfig,
 )
+
+import vllm._custom_ops as ops
+from vllm.model_executor.layers.quantization import awq_gemv_config
 from vllm.model_executor.parameter import (
     GroupQuantScaleParameter,
     PackedvLLMParameter,
