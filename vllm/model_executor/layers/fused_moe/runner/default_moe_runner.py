@@ -785,8 +785,6 @@ class DefaultMoERunner(MoERunner):
         # the moe_forward custom op, so it is not compiled by dynamo.
         layer.ensure_moe_quant_config_init()
 
-        self.ensure_dp_chunking_init()
-
         self.use_shared_experts_stream = (
             current_platform.is_cuda()
             and self.has_separate_shared_experts
