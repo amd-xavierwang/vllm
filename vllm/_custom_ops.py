@@ -2651,7 +2651,7 @@ def wvSplitK_int4_g_zp(
     zero_points: torch.Tensor,
     cu_count: int,
     group_size: int,
-    bias: torch.Tensor = None,
+    bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.ops._rocm_C.wvSplitK_int4_g_zp(
         a, b, scale, zero_points, bias, cu_count, group_size
