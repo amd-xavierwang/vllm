@@ -290,9 +290,6 @@ def awq_gemm_triton(
     scales: torch.Tensor,
     qzeros: torch.Tensor,
     split_k_iters: int,
-    block_size_m: int = 32,
-    block_size_n: int = 32,
-    block_size_k: int = 32,
 ) -> torch.Tensor:
     M, K = input.shape
     N = qweight.shape[1] * 8
@@ -316,6 +313,8 @@ def awq_gemm_triton(
 
     # A = input, B = qweight, C = result
     # A = M x K, B = K x N, C = M x N
+    # Keep a single conservative config here: it beat the original 32x32x32
+    # baseline across a broad M<256 AWQ sweep without adding more variants.
     awq_gemm_kernel[grid](
         input,
         qweight,
@@ -326,10 +325,12 @@ def awq_gemm_triton(
         N,
         K,
         group_size,
-        BLOCK_SIZE_M=block_size_m,
-        BLOCK_SIZE_N=block_size_n,
-        BLOCK_SIZE_K=block_size_k,
+        BLOCK_SIZE_M=32,
+        BLOCK_SIZE_N=64,
+        BLOCK_SIZE_K=64,
         SPLIT_K=split_k_iters,
+        num_warps=4,
+        num_stages=2,
     )
 
     result = result.sum(0)
