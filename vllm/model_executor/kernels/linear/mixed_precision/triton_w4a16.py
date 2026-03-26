@@ -311,17 +311,21 @@ def triton_w4a16_skinny_fmt_gemm(
             BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 64, 32, 4
         elif M <= 128:
             if K >= 2 * N:  # tall K (e.g. down_proj)
-                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 32, 64, 2
-            else:  # N >= K (e.g. qkv_proj, o_proj, gate_up_proj)
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 16, 64, 1
+            elif N > K:  # wide N (e.g. qkv_proj, gate_up_proj)
                 BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 64, 64, 4
+            else:  # N ~= K (e.g. o_proj)
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 32, 64, 4
         elif M <= 1024:
             if K >= 2 * N:  # tall K (e.g. down_proj)
                 BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 64, 64, 4
+            elif N >= 4 * K:  # very wide N (e.g. gate_up_proj)
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 128, 64, 64, 8
             else:
                 BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 128, 32, 4
         else:
             if K >= 2 * N:  # tall K (e.g. down_proj)
-                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 128, 32, 4
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 256, 16, 4
             else:
                 BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 128, 64, 64, 8
     else:
