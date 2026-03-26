@@ -155,6 +155,7 @@ class HipW4A16SkinnyLinearKernel(MPLinearKernel):
         # Process zero points for asymmetric quantization
         self._w_zp = None
         if c.zero_points:
+            assert self.w_zp_name is not None
             w_zp_raw = getattr(layer, self.w_zp_name)
             packed_zp = w_zp_raw.data  # [M // pack_factor, num_groups], int32
             pack_factor = 32 // c.weight_type.size_bits  # 8 for 4-bit
