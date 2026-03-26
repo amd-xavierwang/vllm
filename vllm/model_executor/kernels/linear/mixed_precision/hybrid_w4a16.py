@@ -190,27 +190,19 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         )
 
         # ---- Pack into skinny format: [N, K//8] ExLlama shuffle ----
-        if c.act_type == torch.float16:
-            unsigned = unpacked.to(torch.uint8)  # [N, K]
-            N_dim, K_dim = unsigned.shape
-            g = unsigned.view(N_dim, K_dim // 8, 8).to(torch.int32)
-            shuffled = (
-                g[:, :, 0]
-                | (g[:, :, 2] << 4)
-                | (g[:, :, 4] << 8)
-                | (g[:, :, 6] << 12)
-                | (g[:, :, 1] << 16)
-                | (g[:, :, 3] << 20)
-                | (g[:, :, 5] << 24)
-                | (g[:, :, 7] << 28)
-            )
-        else:
-            bias_val = c.weight_type.bias
-            signed = (unpacked - bias_val).to(torch.int8)  # [N, K]
-            N_dim, K_dim = signed.shape
-            low = signed[:, 0::2] & 0xF
-            high = signed[:, 1::2] & 0xF
-            shuffled = (low | (high << 4)).to(torch.int32)
+        unsigned = unpacked.to(torch.uint8)  # [N, K]
+        N_dim, K_dim = unsigned.shape
+        g = unsigned.view(N_dim, K_dim // 8, 8).to(torch.int32)
+        shuffled = (
+            g[:, :, 0]
+            | (g[:, :, 2] << 4)
+            | (g[:, :, 4] << 8)
+            | (g[:, :, 6] << 12)
+            | (g[:, :, 1] << 16)
+            | (g[:, :, 3] << 20)
+            | (g[:, :, 5] << 24)
+            | (g[:, :, 7] << 28)
+        )
 
         # Store as int8 for skinny kernel, keep int32 view for triton kernel
         w_q_skinny = shuffled.contiguous().view(torch.int8).contiguous()

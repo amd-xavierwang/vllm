@@ -159,29 +159,20 @@ class HipW4A16SkinnyLinearKernel(MPLinearKernel):
             unpacked = unpack_quantized_values_into_int32(
                 x.data, c.weight_type, packed_dim=x.packed_dim
             )
-            if c.act_type == torch.float16:
-                unsigned = unpacked.to(torch.uint8)
-                M, K_dim = unsigned.shape
-                g = unsigned.view(M, K_dim // 8, 8).to(torch.int32)
-                shuffled = (
-                    g[:, :, 0]
-                    | (g[:, :, 2] << 4)
-                    | (g[:, :, 4] << 8)
-                    | (g[:, :, 6] << 12)
-                    | (g[:, :, 1] << 16)
-                    | (g[:, :, 3] << 20)
-                    | (g[:, :, 5] << 24)
-                    | (g[:, :, 7] << 28)
-                )
-                return shuffled.contiguous().view(torch.int8).contiguous()
-            else:
-                bias_val = c.weight_type.bias
-                signed = (unpacked - bias_val).to(torch.int8)
-                M, K_dim = signed.shape
-                low = signed[:, 0::2] & 0xF
-                high = signed[:, 1::2] & 0xF
-                packed = (low | (high << 4)).to(torch.uint8)
-                return packed.view(torch.int8).contiguous()
+            unsigned = unpacked.to(torch.uint8)
+            M, K_dim = unsigned.shape
+            g = unsigned.view(M, K_dim // 8, 8).to(torch.int32)
+            shuffled = (
+                g[:, :, 0]
+                | (g[:, :, 2] << 4)
+                | (g[:, :, 4] << 8)
+                | (g[:, :, 6] << 12)
+                | (g[:, :, 1] << 16)
+                | (g[:, :, 3] << 20)
+                | (g[:, :, 5] << 24)
+                | (g[:, :, 7] << 28)
+            )
+            return shuffled.contiguous().view(torch.int8).contiguous()
 
         def transform_w_s(x: BasevLLMParameter) -> torch.Tensor:
             if c.group_size == -1:

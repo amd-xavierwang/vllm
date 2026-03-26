@@ -247,11 +247,20 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
                             *(const half2*)&BIAS_HI);
               }
             } else {
+              // ExLlama shuffle: 8 unsigned int4 values packed per uint32
+              // Bit layout: [v0,v2,v4,v6] in low 16 bits,
+              //             [v1,v3,v5,v7] in high 16 bits
   #pragma unroll
-              for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
-                uint8_t p = bigB[y][k2].b[b];
-                cvtB.h[2 * b] = (scalar_t)(((int8_t)((p & 0xF) << 4)) >> 4);
-                cvtB.h[2 * b + 1] = (scalar_t)(((int8_t)(p & 0xF0)) >> 4);
+              for (uint32_t w = 0; w < A_CHUNK / 8; w++) {
+                uint32_t qa = bigB[y][k2].u32[w];
+                cvtB.h[w * 8 + 0] = (scalar_t)((int)(qa & 0xF) - 8);
+                cvtB.h[w * 8 + 1] = (scalar_t)((int)((qa >> 16) & 0xF) - 8);
+                cvtB.h[w * 8 + 2] = (scalar_t)((int)((qa >> 4) & 0xF) - 8);
+                cvtB.h[w * 8 + 3] = (scalar_t)((int)((qa >> 20) & 0xF) - 8);
+                cvtB.h[w * 8 + 4] = (scalar_t)((int)((qa >> 8) & 0xF) - 8);
+                cvtB.h[w * 8 + 5] = (scalar_t)((int)((qa >> 24) & 0xF) - 8);
+                cvtB.h[w * 8 + 6] = (scalar_t)((int)((qa >> 12) & 0xF) - 8);
+                cvtB.h[w * 8 + 7] = (scalar_t)((int)((qa >> 28) & 0xF) - 8);
               }
             }
 
@@ -477,11 +486,20 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
                             *(const half2*)&BIAS_HI);
               }
             } else {
+              // ExLlama shuffle: 8 unsigned int4 values packed per uint32
+              // Bit layout: [v0,v2,v4,v6] in low 16 bits,
+              //             [v1,v3,v5,v7] in high 16 bits
   #pragma unroll
-              for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
-                uint8_t p = bigB[y][k2].b[b];
-                cvtB.h[2 * b] = (scalar_t)(((int8_t)((p & 0xF) << 4)) >> 4);
-                cvtB.h[2 * b + 1] = (scalar_t)(((int8_t)(p & 0xF0)) >> 4);
+              for (uint32_t w = 0; w < A_CHUNK / 8; w++) {
+                uint32_t qa = bigB[y][k2].u32[w];
+                cvtB.h[w * 8 + 0] = (scalar_t)((int)(qa & 0xF) - 8);
+                cvtB.h[w * 8 + 1] = (scalar_t)((int)((qa >> 16) & 0xF) - 8);
+                cvtB.h[w * 8 + 2] = (scalar_t)((int)((qa >> 4) & 0xF) - 8);
+                cvtB.h[w * 8 + 3] = (scalar_t)((int)((qa >> 20) & 0xF) - 8);
+                cvtB.h[w * 8 + 4] = (scalar_t)((int)((qa >> 8) & 0xF) - 8);
+                cvtB.h[w * 8 + 5] = (scalar_t)((int)((qa >> 24) & 0xF) - 8);
+                cvtB.h[w * 8 + 6] = (scalar_t)((int)((qa >> 12) & 0xF) - 8);
+                cvtB.h[w * 8 + 7] = (scalar_t)((int)((qa >> 28) & 0xF) - 8);
               }
             }
 
