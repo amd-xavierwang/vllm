@@ -14,7 +14,7 @@ from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
 LDS_CAPACITY_ELEMENTS = 64 * 1024 // 2  # 32768 fp16 elements
 
-SKINNY_GEMM_MAX_N = 4
+SKINNY_GEMM_MAX_N = 5
 
 
 def _w4a16_apply_impl(
