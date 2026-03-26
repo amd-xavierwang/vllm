@@ -173,6 +173,188 @@ def triton_w4a16_gemm_kernel(
     tl.store(c_ptrs, c, mask=mask_c)
 
 
+@triton.jit
+def triton_w4a16_skinny_fmt_kernel(
+    # Pointers
+    a_ptr,  # [M, K]  fp16/bf16 activations
+    b_ptr,  # [N, K//8]  int32 packed (ExLlama shuffle, K is packed dim)
+    scales_ptr,  # [N, K//G]  fp16/bf16 scales (skinny layout)
+    c_ptr,  # [M, N]  fp16/bf16 output
+    # Dimensions
+    M,
+    N,
+    K,
+    K8,  # K // 8
+    num_groups,  # K // group_size
+    # Quantization parameters
+    group_size,
+    ZP_BIAS: tl.constexpr,
+    # Block sizes
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    Fused W4A16 GEMM reading weights from skinny format [N, K//8].
+
+    B is stored as [N, K//8] int32 using ExLlama shuffle packing:
+      each int32 packs 8 K-values with interleave [0,2,4,6,1,3,5,7]:
+        packed = val[0] | (val[2]<<4) | (val[4]<<8) | (val[6]<<12)
+               | (val[1]<<16) | (val[3]<<20) | (val[5]<<24) | (val[7]<<28)
+
+    Scales are [N, K//G] (skinny layout, NOT transposed).
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # ExLlama unshuffle shifts: shift[j] = (j//2)*4 + (j%2)*16
+    # For 8 values: [0, 16, 4, 20, 8, 24, 12, 28]
+    exllama_shifts_row = (tl.arange(0, 8) // 2) * 4 + (tl.arange(0, 8) % 2) * 16
+    # Tile across BLOCK_K: repeat the 8-element pattern BLOCK_K//8 times
+    shifts_1d = tl.reshape(
+        tl.broadcast_to(exllama_shifts_row[None, :], (BLOCK_K // 8, 8)),
+        (BLOCK_K,),
+    )
+    # Broadcast to [BLOCK_N, BLOCK_K]
+    shifts_full = tl.broadcast_to(shifts_1d[None, :], (BLOCK_N, BLOCK_K))
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k_start in range(0, tl.cdiv(K, BLOCK_K)):
+        offs_k = k_start * BLOCK_K + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+
+        # ---- Load activations A: [BLOCK_M, BLOCK_K] ----
+        a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
+        mask_a = (offs_m[:, None] < M) & mask_k[None, :]
+        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+
+        # ---- Load packed weights B: [BLOCK_N, BLOCK_K//8] int32 ----
+        offs_k8 = k_start * (BLOCK_K // 8) + tl.arange(0, BLOCK_K // 8)
+        b_ptrs = b_ptr + offs_n[:, None] * K8 + offs_k8[None, :]
+        mask_b = (offs_n[:, None] < N) & (offs_k8[None, :] < K8)
+        b_packed = tl.load(b_ptrs, mask=mask_b, other=0)
+
+        # ---- Unpack int4 weights with ExLlama unshuffle ----
+        b = tl.interleave(b_packed, b_packed)
+        b = tl.interleave(b, b)
+        b = tl.interleave(b, b)
+        b = (b >> shifts_full) & 0xF  # [BLOCK_N, BLOCK_K]
+
+        # ---- Load scales from [N, K//G] layout ----
+        g_idx = (k_start * BLOCK_K) // group_size
+        scale_ptrs = scales_ptr + offs_n * num_groups + g_idx
+        scale_mask = offs_n < N
+        scales = tl.load(scale_ptrs, mask=scale_mask, other=1.0)
+
+        # ---- Dequantize: (w - zp_bias) * scale → [BLOCK_N, BLOCK_K] ----
+        b_fp = (b - ZP_BIAS).to(scales.dtype) * scales[:, None]
+
+        # ---- Transpose to [BLOCK_K, BLOCK_N] for matmul ----
+        b_fp_t = tl.trans(b_fp)
+
+        # ---- Accumulate: [BLOCK_M, BLOCK_K] @ [BLOCK_K, BLOCK_N] ----
+        accumulator += tl.dot(a, b_fp_t, out_dtype=tl.float32)
+
+    # ---- Store output C: [BLOCK_M, BLOCK_N] ----
+    c = accumulator.to(c_ptr.type.element_ty)
+    c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]
+    mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, c, mask=mask_c)
+
+
+def triton_w4a16_skinny_fmt_gemm(
+    a: torch.Tensor,  # [M, K] fp16/bf16
+    b_q: torch.Tensor,  # [N, K//8] int32 (ExLlama shuffle packed)
+    scales: torch.Tensor,  # [N, K//G] fp16/bf16
+    group_size: int,
+    zp_bias: int = 8,
+) -> torch.Tensor:
+    """
+    Fused W4A16 GEMM reading from skinny weight format [N, K//8].
+
+    Args:
+        a:          Activation matrix [M, K], float16 or bfloat16.
+        b_q:        Packed weight matrix [N, K//8], int32 (ExLlama shuffle).
+        scales:     Per-group scales [N, K//G], same dtype as a.
+        group_size: Quantization group size (resolved from -1 to K by caller).
+        zp_bias:    Constant zero bias (default 8 for uint4b8 symmetric).
+
+    Returns:
+        Output matrix [M, N], same dtype as a.
+    """
+    assert a.is_contiguous(), "Activation matrix must be contiguous"
+    assert b_q.is_contiguous(), "Weight matrix must be contiguous"
+    assert scales.is_contiguous(), "Scales must be contiguous"
+
+    M, K = a.shape
+    N = b_q.shape[0]
+    K8 = K // 8
+    num_groups = K // group_size
+
+    assert b_q.shape == (N, K8), f"b_q shape mismatch: {b_q.shape} vs ({N}, {K8})"
+    assert scales.shape == (N, num_groups), (
+        f"scales shape mismatch: {scales.shape} vs ({N}, {num_groups})"
+    )
+
+    c = torch.empty((M, N), dtype=a.dtype, device=a.device)
+
+    if _IS_RDNA:
+        # Tuned on gfx1151 (Strix Halo, 40 CUs, 32-wide wavefronts)
+        # using Qwen3-4B weight shapes with group_size=128.
+        if M <= 32:
+            BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 32, 32, 128, 4
+        elif M <= 64:
+            BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 64, 32, 4
+        elif M <= 128:
+            if K >= 2 * N:  # tall K (e.g. down_proj)
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 32, 64, 2
+            else:  # N >= K (e.g. qkv_proj, o_proj, gate_up_proj)
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 64, 64, 4
+        elif M <= 1024:
+            if K >= 2 * N:  # tall K (e.g. down_proj)
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 64, 64, 4
+            else:
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 128, 32, 4
+        else:
+            if K >= 2 * N:  # tall K (e.g. down_proj)
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 128, 32, 4
+            else:
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 128, 64, 64, 8
+    else:
+        num_warps = 4
+        if M <= 32:
+            BLOCK_M, BLOCK_N, BLOCK_K = 32, 64, 32
+        elif M <= 64:
+            BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+        else:
+            BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 32
+
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+
+    triton_w4a16_skinny_fmt_kernel[grid](
+        a,
+        b_q,
+        scales,
+        c,
+        M,
+        N,
+        K,
+        K8,
+        num_groups,
+        group_size=group_size,
+        ZP_BIAS=zp_bias,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_warps=num_warps,
+    )
+    return c
+
+
 def triton_w4a16_gemm(
     a: torch.Tensor,  # [M, K] fp16/bf16
     b_q: torch.Tensor,  # [K, N//8] int32
@@ -221,17 +403,30 @@ def triton_w4a16_gemm(
     zeros_ptr = qzeros if has_zp else b_q
 
     if _IS_RDNA:
-        # Tuned for gfx1151 (Strix Halo, 40 CUs, 32-wide wavefronts).
-        # Smaller BLOCK_N (32-64) gives better occupancy and reduces
-        # register pressure from the interleave+shift unpacking.
+        # Tuned on gfx1151 (Strix Halo, 40 CUs, 32-wide wavefronts)
+        # using Qwen3-4B weight shapes with group_size=128.
         if M <= 32:
-            BLOCK_M, BLOCK_N, BLOCK_K = 32, 32, 64
+            BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 32, 32, 128, 4
         elif M <= 64:
-            BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+            BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 64, 32, 4
+        elif M <= 128:
+            if K >= 2 * N:  # tall K (e.g. down_proj)
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 32, 64, 2
+            else:
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 128, 32, 64, 4
+        elif M <= 1024:
+            if K >= 2 * N:  # tall K (e.g. down_proj)
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 64, 64, 32, 4
+            else:
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 128, 128, 32, 8
         else:
-            BLOCK_M, BLOCK_N, BLOCK_K = 128, 32, 64
+            if K >= 2 * N:  # tall K (e.g. down_proj)
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 128, 128, 32, 4
+            else:
+                BLOCK_M, BLOCK_N, BLOCK_K, num_warps = 128, 64, 64, 8
     else:
         # Tuned for MI300 (gfx942, 304 CUs, 64-wide wavefronts).
+        num_warps = 4
         if M <= 32:
             BLOCK_M, BLOCK_N, BLOCK_K = 32, 64, 32
         elif M <= 64:
@@ -262,6 +457,7 @@ def triton_w4a16_gemm(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
+        num_warps=num_warps,
     )
     return c
 
