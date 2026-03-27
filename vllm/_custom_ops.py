@@ -2552,6 +2552,37 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "wvSplitK_int4_g
         return torch.empty((N, M), dtype=in_b.dtype, device=in_b.device)
 
 
+def wvSplitK_int4_g_zp(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    scale: torch.Tensor,
+    zero_points: torch.Tensor,
+    cu_count: int,
+    group_size: int,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.ops._rocm_C.wvSplitK_int4_g_zp(
+        a, b, scale, zero_points, bias, cu_count, group_size
+    )
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "wvSplitK_int4_g_zp"):
+
+    @register_fake("_rocm_C::wvSplitK_int4_g_zp")
+    def _wvSplitK_int4_g_zp_fake(
+        in_a: torch.Tensor,
+        in_b: torch.Tensor,
+        in_scale: torch.Tensor,
+        in_zero_points: torch.Tensor,
+        in_bias: torch.Tensor | None,
+        CuCount: int,
+        group_size: int,
+    ) -> torch.Tensor:
+        N = in_b.size(0)
+        M = in_a.size(0)
+        return torch.empty((N, M), dtype=in_b.dtype, device=in_b.device)
+
+
 def wvSplitK_int4g_sweep(
     a: torch.Tensor,
     b: torch.Tensor,
