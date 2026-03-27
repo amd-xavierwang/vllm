@@ -40,8 +40,7 @@ from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
     BaseProcessingInfo,
-    PromptIndexTargets,
-    PromptInsertion,
+    PromptReplacement,
     PromptUpdate,
     PromptUpdateDetails,
 )
@@ -303,8 +302,9 @@ class OpenVLADummyInputsBuilder(BaseDummyInputsBuilder[OpenVLAProcessingInfo]):
     """Builds dummy inputs for profiling OpenVLA."""
 
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
-        # Empty string - image tokens are inserted at prefix, not as replacement
-        return ""
+        num_images = mm_counts.get("image", 0)
+        # OpenVLA uses <PAD> (token 32000) as the image placeholder token
+        return "<PAD>" * num_images
 
     def get_dummy_mm_data(
         self,
@@ -456,7 +456,7 @@ class OpenVLAMultiModalProcessor(BaseMultiModalProcessor[OpenVLAProcessingInfo])
 
         # Handle no images case (profiling)
         if num_images == 0:
-            num_images = self.allowed_mm_limits.get("image", 1)
+            num_images = self.info.allowed_mm_limits.get("image", 1)
             dummy_image = PIL.Image.new("RGB", (224, 224), color=(128, 128, 128))
             images = [dummy_image]
         else:
@@ -496,13 +496,9 @@ class OpenVLAMultiModalProcessor(BaseMultiModalProcessor[OpenVLAProcessingInfo])
         out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
         hf_config = self.info.get_hf_config()
-        # Use image_token_index (32000) as placeholder for image features
         image_token_id = getattr(hf_config, "image_token_index", 32000)
-        # Get BOS token from tokenizer
-        tokenizer = self.info.ctx.tokenizer
-        bos_token_id = tokenizer.bos_token_id
 
-        def get_insertion(item_idx: int):
+        def get_replacement(item_idx: int):
             num_image_tokens = self.info.get_num_image_tokens(
                 image_width=224,
                 image_height=224,
@@ -515,14 +511,11 @@ class OpenVLAMultiModalProcessor(BaseMultiModalProcessor[OpenVLAProcessingInfo])
                 embed_token_id=image_token_id,
             )
 
-        # Insert image tokens at the start of the prompt (after BOS if present)
         return [
-            PromptInsertion(
+            PromptReplacement(
                 modality="image",
-                target=PromptIndexTargets.prefix(
-                    [bos_token_id] if bos_token_id is not None else []
-                ),
-                insertion=get_insertion,
+                target=[image_token_id],
+                replacement=get_replacement,
             ),
         ]
 
@@ -542,7 +535,7 @@ class OpenVLAForActionPrediction(nn.Module, SupportsMultiModal, SupportsPP):
 
     Action prediction:
     - 7D action space: [dx, dy, dz, drx, dry, drz, gripper]
-    - 256 bins per dimension (tokens 32000-32255 in Llama vocab)
+    - 256 bins per dimension (token IDs 31744-31999 in Llama vocab)
     - Autoregressive generation of 7 action tokens
     """
 
@@ -561,9 +554,8 @@ class OpenVLAForActionPrediction(nn.Module, SupportsMultiModal, SupportsPP):
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
-            # Return None because image tokens are inserted at prefix,
-            # not replaced from a placeholder string in the prompt
-            return None
+            # OpenVLA uses <PAD> (token 32000) as the image placeholder
+            return "<PAD>"
         raise ValueError("Only image modality is supported")
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -653,6 +645,8 @@ class OpenVLAForActionPrediction(nn.Module, SupportsMultiModal, SupportsPP):
             raise RuntimeError("Vision components not initialized")
 
         pixel_values = image_input.pixel_values
+        p = next(self.vision_backbone.parameters())
+        pixel_values = pixel_values.to(device=p.device, dtype=p.dtype)
         vision_features = self.vision_backbone(pixel_values)
         return self.projector(vision_features)
 

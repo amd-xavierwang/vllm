@@ -52,5 +52,4 @@ class OpenVLAConfig(PretrainedConfig):
             text_config = LlamaConfig(**text_config)
         self.text_config = text_config
 
-        # Also add pad_token_id for image token placeholder
-        self.pad_token_id = 32000
+        self.pad_token_id = self.image_token_index
