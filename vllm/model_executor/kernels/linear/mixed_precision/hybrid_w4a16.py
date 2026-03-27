@@ -28,8 +28,8 @@ from .triton_w4a16 import (
     triton_w4a16_skinny_fmt_gemm,
 )
 
-# Match the skinny kernel's threshold
-SKINNY_THRESHOLD = 4
+# Match the skinny kernel's threshold (C++ supports N_in up to 5)
+SKINNY_THRESHOLD = 5
 LDS_CAPACITY_ELEMENTS = 64 * 1024 // 2  # 32768 fp16 elements
 
 
