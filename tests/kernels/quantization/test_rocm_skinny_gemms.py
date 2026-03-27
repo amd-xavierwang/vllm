@@ -160,6 +160,8 @@ def test_rocm_wvsplitkrc_kernel(xnorm, n, k, m, dtype, seed, padded_a, bias_mode
         BIAS = torch.rand(m, dtype=dtype, device="cuda") * 2 - 1
     elif bias_mode == 2:
         BIAS = torch.rand(n, m, dtype=dtype, device="cuda") * 2 - 1
+    elif bias_mode == 3:
+        BIAS = torch.rand(1, m, dtype=dtype, device="cuda") * 2 - 1
 
     ref_out = torch.nn.functional.linear(A, B, BIAS)
     out = ops.wvSplitKrc(A, B, cu_count, BIAS)
@@ -229,7 +231,7 @@ def test_rocm_wvsplitk_kernel(
     else:
         # Accumulation error in fp16 GEMM scales with sqrt(K)
         atol = torch.finfo(dtype).eps * math.sqrt(k)
-        assert torch.allclose(out, ref_out, rtol=0.01, atol=atol)
+        torch.testing.assert_close(out, ref_out, atol=atol, rtol=1e-2)
 
 
 @pytest.mark.parametrize("xnorm", [False, True])
