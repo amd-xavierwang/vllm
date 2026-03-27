@@ -340,14 +340,20 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TRITON_MLA,
             ]
 
-    backends = [
-        AttentionBackendEnum.ROCM_ATTN,
-    ]
+    backends = []
     if rocm_aiter_ops.is_mha_enabled():
         backends.append(AttentionBackendEnum.ROCM_AITER_FA)
     if is_aiter_found_and_supported():
         backends.append(AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN)
-    backends.append(AttentionBackendEnum.TRITON_ATTN)
+    if on_gfx1x():
+        # On RDNA (gfx11/gfx12), TRITON_ATTN is faster than ROCM_ATTN
+        # because ROCM_ATTN's custom paged attention kernel falls back
+        # to Triton internally with extra overhead.
+        backends.append(AttentionBackendEnum.TRITON_ATTN)
+        backends.append(AttentionBackendEnum.ROCM_ATTN)
+    else:
+        backends.append(AttentionBackendEnum.ROCM_ATTN)
+        backends.append(AttentionBackendEnum.TRITON_ATTN)
 
     return backends
 
