@@ -21,6 +21,15 @@
   #define __HIP__GFX11__
 #endif
 
+#if defined(__HIPCC__) && defined(__GFX12__)
+  #define __HIP__GFX12__
+#endif
+
+// Combined RDNA macro (gfx11 + gfx12) - both use 32-wide wavefronts
+#if defined(__HIP__GFX11__) || defined(__HIP__GFX12__)
+  #define __HIP__GFX1X__
+#endif
+
 #define LDS_SIZE 64 * 1024
 
 static int get_lds_size_int4() {
@@ -36,11 +45,12 @@ static int get_lds_size_int4() {
   return result;
 }
 
-static bool is_gfx11_int4() {
+static bool is_gfx1x_int4() {
   static const bool result = [] {
     auto dprops = at::cuda::getCurrentDeviceProperties();
     std::string device_arch = dprops->gcnArchName;
-    return device_arch.find("gfx11") != std::string::npos;
+    return device_arch.find("gfx11") != std::string::npos ||
+           device_arch.find("gfx12") != std::string::npos;
   }();
   return result;
 }
@@ -108,7 +118,7 @@ struct scalar<c10::BFloat16> {
     V0 += (s.x + s.y);                                                      \
   }
 
-#if defined(__HIP__GFX11__)
+#if defined(__HIP__GFX1X__)
   #define REDUCE_SUM_WAVE32(val)  \
     do {                          \
       val += __shfl_xor(val, 1);  \
@@ -130,7 +140,7 @@ __device__ inline unsigned int min__(uint32_t a, uint32_t b) {
 // GROUP_SIZE: 0 = per-channel scale [M], >0 = per-group scale [M,
 // K/GROUP_SIZE].
 //   Requires GROUP_SIZE % A_CHUNK == 0 when GROUP_SIZE > 0.
-#if defined(__HIP__GFX9__) || defined(__HIP__GFX11__)
+#if defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
           int UNRL, int N, int GROUP_SIZE = 0>
 __global__ void __launch_bounds__(WvPrGrp* THRDS)
@@ -284,7 +294,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
       }
     }
 
-  #if defined(__HIP__GFX11__)
+  #if defined(__HIP__GFX1X__)
     for (int n = 0; n < N; n++)
       for (int y = 0; y < YTILE; y++) REDUCE_SUM_WAVE32(sum[n][y]);
 
@@ -334,11 +344,11 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
         }
       }
     }
-  #endif  // defined(__HIP__GFX11__)
+  #endif  // defined(__HIP__GFX1X__)
     m += CuCount * _WvPrGrp * YTILE;
   }
 }
-#else   // !defined(__HIP__GFX9__) && !defined(__HIP__GFX11__)
+#else   // !defined(__HIP__GFX9__) && !defined(__HIP__GFX1X__)
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
           int UNRL, int N, int GROUP_SIZE = 0>
 __global__ void wvSplitK_int4_hf_sml_(const int K, const int M, const int Bx,
@@ -350,12 +360,12 @@ __global__ void wvSplitK_int4_hf_sml_(const int K, const int M, const int Bx,
                                       const int CuCount) {
   UNREACHABLE_CODE
 }
-#endif  // defined(__HIP__GFX9__) || defined(__HIP__GFX11__)
+#endif  // defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
 
 // W4A16 skinny GEMM "medium" kernel: activation matrix marginally exceeds LDS.
 // Loads as much of A into LDS as fits; overflowing rows fall back to global
 // memory.  Also handles M not divisible by YTILE via commitColumn tracking.
-#if defined(__HIP__GFX9__) || defined(__HIP__GFX11__)
+#if defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
           int UNRL, int N, int GROUP_SIZE = 0>
 __global__ void __launch_bounds__(WvPrGrp* THRDS)
@@ -523,7 +533,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
       }
     }
 
-  #if defined(__HIP__GFX11__)
+  #if defined(__HIP__GFX1X__)
     for (int n = 0; n < N; n++)
       for (int y = 0; y < YTILE; y++) REDUCE_SUM_WAVE32(sum[n][y]);
 
@@ -577,7 +587,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
         }
       }
     }
-  #endif  // defined(__HIP__GFX11__)
+  #endif  // defined(__HIP__GFX1X__)
     m += CuCount * _WvPrGrp * YTILE;
 
     if (m < M && (m + YTILE) >= M) {
@@ -589,7 +599,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
     }
   }
 }
-#else   // !defined(__HIP__GFX9__) && !defined(__HIP__GFX11__)
+#else   // !defined(__HIP__GFX9__) && !defined(__HIP__GFX1X__)
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
           int UNRL, int N, int GROUP_SIZE = 0>
 __global__ void wvSplitK_int4_hf_(const int K, const int M, const int Bx,
@@ -601,7 +611,7 @@ __global__ void wvSplitK_int4_hf_(const int K, const int M, const int Bx,
                                   const int CuCount) {
   UNREACHABLE_CODE
 }
-#endif  // defined(__HIP__GFX9__) || defined(__HIP__GFX11__)
+#endif  // defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
 
 static int mindiv_int4(int N, int div1, int div2) {
   int nPrRnd = div1 * div2;
@@ -680,7 +690,7 @@ torch::Tensor wvSplitK_int4(const at::Tensor& in_a, const at::Tensor& in_b,
   }
 
 #define WVSPLITK_INT4(_YTILE, _UNRL, _N)        \
-  if (is_gfx11_int4())                          \
+  if (is_gfx1x_int4())                          \
     WVSPLITK_INT4_LAUNCH(32, _YTILE, _UNRL, _N) \
   else                                          \
     WVSPLITK_INT4_LAUNCH(64, _YTILE, _UNRL, _N)
@@ -787,7 +797,7 @@ torch::Tensor wvSplitK_int4_sweep(const at::Tensor& in_a,
   const fptype* biasptr = nullptr;
   fptype* cptr = reinterpret_cast<fptype*>(out_c.data_ptr());
 
-  const int THRDS = is_gfx11_int4() ? 32 : 64;
+  const int THRDS = is_gfx1x_int4() ? 32 : 64;
 
   #define SWEEP_LAUNCH(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, _N)          \
     {                                                                         \
@@ -949,7 +959,7 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_a, const at::Tensor& in_b,
   }
 
 #define WVSPLITK_INT4G(_YTILE, _UNRL, _N, _GS)        \
-  if (is_gfx11_int4())                                \
+  if (is_gfx1x_int4())                                \
     WVSPLITK_INT4G_LAUNCH(32, _YTILE, _UNRL, _N, _GS) \
   else                                                \
     WVSPLITK_INT4G_LAUNCH(64, _YTILE, _UNRL, _N, _GS)
@@ -1075,7 +1085,7 @@ torch::Tensor wvSplitK_int4g_sweep(
   const fptype* biasptr = nullptr;
   fptype* cptr = reinterpret_cast<fptype*>(out_c.data_ptr());
 
-  const int THRDS = is_gfx11_int4() ? 32 : 64;
+  const int THRDS = is_gfx1x_int4() ? 32 : 64;
 
   #define SWEEP_G_LAUNCH(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, _N, _GS)   \
     {                                                                         \
@@ -1219,7 +1229,7 @@ torch::Tensor wvSplitK_int4g_hf_sweep(
   const fptype* biasptr = nullptr;
   fptype* cptr = reinterpret_cast<fptype*>(out_c.data_ptr());
 
-  const int THRDS = is_gfx11_int4() ? 32 : 64;
+  const int THRDS = is_gfx1x_int4() ? 32 : 64;
 
   #define SWEEP_GHF_LAUNCH(_THRDS, _YTILE, _WVPRGRP, _ACHUNK, _UNRL, _N, _GS) \
     {                                                                         \
