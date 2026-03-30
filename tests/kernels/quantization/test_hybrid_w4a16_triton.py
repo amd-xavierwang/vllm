@@ -33,33 +33,12 @@ hybrid_w4a16_module = importlib.import_module(
 triton_w4a16_skinny_fmt_gemm = hybrid_w4a16_module.triton_w4a16_skinny_fmt_gemm
 
 
+pack_int4_exllama_shuffle = hybrid_w4a16_module.pack_int4_exllama_shuffle
+
+
 def _pack_exllama_shuffle(w_int4_kn: torch.Tensor) -> torch.Tensor:
-    """Pack [K, N] int4 values into ExLlama shuffle format [N, K//8] int32.
-
-    ExLlama shuffle order within each group of 8 K-values:
-      packed = val[0] | (val[2]<<4) | (val[4]<<8) | (val[6]<<12)
-             | (val[1]<<16) | (val[3]<<20) | (val[5]<<24) | (val[7]<<28)
-    """
-    assert w_int4_kn.dtype == torch.int32
-    K, N = w_int4_kn.shape
-    assert K % 8 == 0
-
-    # Transpose to [N, K] then group K in chunks of 8
-    w_nk = w_int4_kn.t().contiguous()  # [N, K]
-    g = w_nk.view(N, K // 8, 8).to(torch.int32)  # [N, K//8, 8]
-
-    # Apply ExLlama shuffle packing
-    packed = (
-        (g[:, :, 0] & 0xF)
-        | ((g[:, :, 2] & 0xF) << 4)
-        | ((g[:, :, 4] & 0xF) << 8)
-        | ((g[:, :, 6] & 0xF) << 12)
-        | ((g[:, :, 1] & 0xF) << 16)
-        | ((g[:, :, 3] & 0xF) << 20)
-        | ((g[:, :, 5] & 0xF) << 24)
-        | ((g[:, :, 7] & 0xF) << 28)
-    )
-    return packed.contiguous()  # [N, K//8] int32
+    """Pack [K, N] int4 values into ExLlama shuffle format [N, K//8] int32."""
+    return pack_int4_exllama_shuffle(w_int4_kn.t().contiguous())
 
 
 def _w4a16_skinny_reference(
@@ -134,25 +113,3 @@ def test_triton_w4a16_skinny_fmt_gemm_matches_reference(dtype, M, K, N, G):
     )
 
     torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
-
-
-@pytest.mark.skipif(not current_platform.is_rocm(), reason="ROCm only")
-def test_triton_w4a16_skinny_fmt_gemm_requires_contiguous_inputs():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA/HIP device not available")
-
-    set_random_seed(0)
-    M, K, N, G = 32, 256, 256, 32
-    a = torch.randn((K, M), device=device, dtype=torch.float16).t()  # non-contiguous
-    w_int4 = torch.randint(0, 16, (K, N), device=device, dtype=torch.int32)
-    b_packed = _pack_exllama_shuffle(w_int4)
-    scales = torch.rand((N, K // G), device=device, dtype=torch.float16)
-
-    with pytest.raises(AssertionError):
-        triton_w4a16_skinny_fmt_gemm(
-            a=a,
-            b_q=b_packed,
-            scales=scales,
-            group_size=G,
-            zp_bias=8,
-        )

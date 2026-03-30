@@ -20,24 +20,13 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     unpack_quantized_values_into_int32,
 )
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx1x
 from vllm.scalar_type import scalar_types
 from vllm.triton_utils import tl, triton
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
-
-def _detect_rdna() -> bool:
-    """Detect RDNA (gfx11xx+) vs CDNA (gfx9xx) at import time."""
-    try:
-        _cc = current_platform.get_device_capability()
-        return _cc is not None and _cc[0] >= 11
-    except Exception:
-        return False
-
-
-_IS_RDNA: bool = _detect_rdna()
-
-SUPPORTED_GROUP_SIZES = [-1, 32, 64, 128, 256]
+SUPPORTED_GROUP_SIZES = [32, 64, 128, 256]
 
 # Match the skinny kernel's threshold (C++ supports N_in up to 5)
 SKINNY_THRESHOLD = 5
@@ -178,7 +167,7 @@ def triton_w4a16_skinny_fmt_gemm(
 
     c = torch.empty((M, N), dtype=a.dtype, device=a.device)
 
-    if _IS_RDNA:
+    if on_gfx1x():
         # Tuned on gfx1151 (Strix Halo, 40 CUs, 32-wide wavefronts)
         # using Qwen3-4B weight shapes with group_size=128.
         if M <= 32:
@@ -236,6 +225,31 @@ def triton_w4a16_skinny_fmt_gemm(
 
 
 # ---------------------------------------------------------------------------
+# Weight packing
+# ---------------------------------------------------------------------------
+
+
+def pack_int4_exllama_shuffle(w_uint4: torch.Tensor) -> torch.Tensor:
+    """Pack uint4 values into ExLlama shuffle format: [N, K] -> [N, K//8] int32.
+
+    Each int32 packs 8 K-values with interleave order [0,2,4,6,1,3,5,7].
+    """
+    N_dim, K_dim = w_uint4.shape
+    assert K_dim % 8 == 0
+    g = w_uint4.to(torch.uint8).view(N_dim, K_dim // 8, 8).to(torch.int32)
+    return (
+        g[:, :, 0]
+        | (g[:, :, 2] << 4)
+        | (g[:, :, 4] << 8)
+        | (g[:, :, 6] << 12)
+        | (g[:, :, 1] << 16)
+        | (g[:, :, 3] << 20)
+        | (g[:, :, 5] << 24)
+        | (g[:, :, 7] << 28)
+    )
+
+
+# ---------------------------------------------------------------------------
 # Hybrid dispatch logic
 # ---------------------------------------------------------------------------
 
@@ -265,16 +279,13 @@ def _hybrid_w4a16_apply_impl(
     K = x_2d.shape[1]
 
     if N <= SKINNY_THRESHOLD and K * N <= LDS_CAPACITY_ELEMENTS:
-        if group_size > 0:
-            return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, bias)
-        else:
-            return ops.wvSplitK_int4(w_q, x_2d, w_s, cu_count, bias)
+        return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, bias)
 
     output = triton_w4a16_skinny_fmt_gemm(
         a=x_2d,
         b_q=w_q_i32,
         scales=w_s,
-        group_size=group_size if group_size > 0 else K,
+        group_size=group_size,
         zp_bias=zp_bias,
     )
     if bias is not None:
@@ -336,9 +347,9 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         # Check HIP skinny op availability
         try:
             if not hasattr(torch.ops, "_rocm_C") or not hasattr(
-                torch.ops._rocm_C, "wvSplitK_int4"
+                torch.ops._rocm_C, "wvSplitK_int4_g"
             ):
-                return False, "wvSplitK_int4 op not available in this build"
+                return False, "wvSplitK_int4_g op not available in this build"
         except Exception:
             return False, "ROCm ops not available"
 
@@ -359,7 +370,7 @@ class HybridW4A16LinearKernel(MPLinearKernel):
             return False, "does not support g_idx reordering"
 
         gs = c.group_size
-        if gs not in SUPPORTED_GROUP_SIZES and gs != c.full_weight_shape[0]:
+        if gs not in SUPPORTED_GROUP_SIZES:
             return (
                 False,
                 f"Group size {gs} not supported; supported: {SUPPORTED_GROUP_SIZES}",
@@ -369,14 +380,10 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         if K % 16 != 0:
             return False, f"K={K} must be divisible by 16"
 
-        eff_gs = gs if gs != -1 else K
-        if K % eff_gs != 0:
-            return False, f"K={K} not divisible by group_size={eff_gs}"
-
-        if c.group_size > 0 and K % c.group_size != 0:
+        if K % gs != 0:
             return (
                 False,
-                f"K={K} must be divisible by group_size={c.group_size}",
+                f"K={K} must be divisible by group_size={gs}",
             )
 
         return True, None
@@ -393,29 +400,14 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         )
 
         # ---- Pack into skinny format: [N, K//8] ExLlama shuffle ----
-        unsigned = unpacked.to(torch.uint8)  # [N, K]
-        N_dim, K_dim = unsigned.shape
-        g = unsigned.view(N_dim, K_dim // 8, 8).to(torch.int32)
-        shuffled = (
-            g[:, :, 0]
-            | (g[:, :, 2] << 4)
-            | (g[:, :, 4] << 8)
-            | (g[:, :, 6] << 12)
-            | (g[:, :, 1] << 16)
-            | (g[:, :, 3] << 20)
-            | (g[:, :, 5] << 24)
-            | (g[:, :, 7] << 28)
-        )
+        shuffled = pack_int4_exllama_shuffle(unpacked)
 
         # Store as int8 for skinny kernel, keep int32 view for triton kernel
         w_q_skinny = shuffled.contiguous().view(torch.int8).contiguous()
         w_q_skinny_i32 = shuffled.contiguous()
 
         # ---- Prepare skinny scales: [N, K//G] ----
-        w_s_skinny = w_s_raw.data
-        if c.group_size == -1:
-            w_s_skinny = w_s_skinny.squeeze(-1)
-        w_s_skinny = w_s_skinny.contiguous()
+        w_s_skinny = w_s_raw.data.contiguous()
 
         # ---- Store on layer ----
         # Replace w_q with skinny int8 (primary weights for skinny kernel)

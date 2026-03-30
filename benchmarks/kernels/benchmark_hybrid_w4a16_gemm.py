@@ -3,13 +3,6 @@
 """
 Benchmark the HybridW4A16LinearKernel across decode and prefill shapes.
 
-This benchmarks _hybrid_w4a16_apply_impl which dispatches:
-  M <= 4:  HIP wvSplitK_int4_g skinny GEMM (decode)
-  M > 4:   Triton W4A16 fused dequant GEMM (prefill, skinny format)
-
-Weights are stored ONCE in skinny layout [N, K//8] int32 (ExLlama shuffle).
-Both the HIP skinny kernel and the triton kernel read from this single copy.
-
 Usage:
     python benchmark_int4_gemm.py
     python benchmark_int4_gemm.py --models Qwen/Qwen3-4B
@@ -45,46 +38,24 @@ WEIGHT_SHAPES = {
 
 
 # ---------------------------------------------------------------------------
-# Weight packing (mirrors hybrid_w4a16.py process_weights_after_loading)
+# Weight packing
 # ---------------------------------------------------------------------------
 def prepare_hybrid_weights(K, N, group_size, device="cuda"):
-    """Create random int4 weights in skinny format + fp16 baseline.
+    """Create random weights for benchmarking.
 
     Returns (w_q_skinny, w_s_skinny, w_fp16, w_q_skinny_i32).
     """
     num_groups = K // group_size
 
-    # Random uint4 values [N, K] (skinny's native layout: output_dim=0)
-    w_int_NK = torch.randint(0, 16, (N, K), dtype=torch.int32, device=device)
-    # Random scales [N, K//G] (skinny's native layout)
-    scales_NK = torch.randn(N, num_groups, dtype=torch.float16, device=device) * 0.01
-
-    # ---- Skinny weights: [N, K//8] int8 (ExLlama shuffle for fp16) ----
-    unsigned = w_int_NK.to(torch.uint8)
-    g = unsigned.view(N, K // 8, 8).to(torch.int32)
-    shuffled = (
-        g[:, :, 0]
-        | (g[:, :, 2] << 4)
-        | (g[:, :, 4] << 8)
-        | (g[:, :, 6] << 12)
-        | (g[:, :, 1] << 16)
-        | (g[:, :, 3] << 20)
-        | (g[:, :, 5] << 24)
-        | (g[:, :, 7] << 28)
+    # Random packed weights — actual values don't matter for throughput
+    w_q_skinny_i32 = torch.randint(
+        0, 2**31, (N, K // 8), dtype=torch.int32, device=device
     )
-    w_q_skinny = shuffled.contiguous().view(torch.int8).contiguous()
+    w_q_skinny = w_q_skinny_i32.view(torch.int8).contiguous()
+    w_s_skinny = torch.randn(N, num_groups, dtype=torch.float16, device=device) * 0.01
 
-    # Also store the skinny weights as int32 for the triton kernel to read
-    w_q_skinny_i32 = shuffled.contiguous()
-
-    # Skinny scales: [N, K//G]
-    w_s_skinny = scales_NK.contiguous()
-
-    # ---- FP16 baseline: dequantize to [N, K] for F.linear ----
-    w_fp = w_int_NK.to(torch.float16) - 8.0
-    w_fp = w_fp.view(N, num_groups, group_size)
-    w_fp = w_fp * scales_NK.unsqueeze(-1)
-    w_fp16 = w_fp.view(N, K).contiguous()
+    # FP16 baseline for F.linear
+    w_fp16 = torch.randn(N, K, dtype=torch.float16, device=device) * 0.01
 
     return w_q_skinny, w_s_skinny, w_fp16, w_q_skinny_i32
 
