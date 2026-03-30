@@ -202,6 +202,11 @@ def triton_w4a16_skinny_fmt_gemm(
         else:
             BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 32
 
+    # The kernel loads one scale per BLOCK_K tile, so BLOCK_K must not
+    # exceed group_size — otherwise elements in the tile that belong to
+    # a different group would get the wrong scale.
+    BLOCK_K = min(BLOCK_K, group_size)
+
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
     _triton_w4a16_skinny_fmt_kernel[grid](
