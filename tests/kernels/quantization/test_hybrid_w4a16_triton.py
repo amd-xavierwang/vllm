@@ -78,13 +78,15 @@ def _w4a16_skinny_reference(
         (64, 1024, 256, 256),
     ],
 )
-def test_triton_w4a16_skinny_fmt_gemm_matches_reference(dtype, M, K, N, G):
+def test_triton_w4a16_skinny_fmt_gemm_matches_reference(
+    dtype, M, K, N, G, random_seed: int
+):
     if not torch.cuda.is_available():
         pytest.skip("CUDA/HIP device not available")
     if K % G != 0 or K % 8 != 0:
         pytest.skip("Invalid test shape")
 
-    set_random_seed(0)
+    set_random_seed(random_seed)
 
     a = (0.25 * torch.randn((M, K), device=device, dtype=torch.float32)).to(dtype)
     w_int4 = torch.randint(0, 16, (K, N), device=device, dtype=torch.int32)

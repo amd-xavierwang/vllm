@@ -4,8 +4,8 @@
 Hybrid W4A16 kernel: Triton for prefill, HIP skinny for decode.
 
 Routes based on batch size M:
-  M <= SKINNY_THRESHOLD: HIP skinny GEMM (wvSplitK_int4/int4_g)
-  M > SKINNY_THRESHOLD:  Triton W4A16 fused dequant GEMM
+  M <= MAX_SKINNY_BATCH_SIZE: HIP skinny GEMM (wvSplitK_int4/int4_g)
+  M > MAX_SKINNY_BATCH_SIZE:  Triton W4A16 fused dequant GEMM
 
 Stores weights ONCE in skinny layout [N, K//8] int32 (ExLlama shuffle).
 Both the HIP skinny kernel and the triton kernel read from this single
@@ -23,13 +23,16 @@ from vllm.platforms import current_platform
 from vllm.platforms.rocm import on_gfx1x
 from vllm.scalar_type import scalar_types
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
 SUPPORTED_GROUP_SIZES = [32, 64, 128, 256]
 
-# Match the skinny kernel's threshold (C++ supports N_in up to 5)
-SKINNY_THRESHOLD = 5
+# Maximum batch size M for the HIP skinny kernel path (C++ supports N_in
+# up to 5).  When M exceeds this AND K*M fits in LDS, the skinny kernel is
+# used; otherwise the Triton prefill path handles the GEMM.
+MAX_SKINNY_BATCH_SIZE = 5
 LDS_CAPACITY_ELEMENTS = 64 * 1024 // 2  # 32768 fp16 elements
 
 
@@ -280,10 +283,12 @@ def _hybrid_w4a16_apply_impl(
     """
     import vllm._custom_ops as ops
 
-    N = x_2d.shape[0]
+    M = x_2d.shape[0]
     K = x_2d.shape[1]
 
-    if N <= SKINNY_THRESHOLD and K * N <= LDS_CAPACITY_ELEMENTS:
+    # Use the HIP skinny kernel for small batch sizes (fast decode path),
+    # but only when K*M fits in LDS.  Otherwise fall through to Triton.
+    if M <= MAX_SKINNY_BATCH_SIZE and K * M <= LDS_CAPACITY_ELEMENTS:
         return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, bias)
 
     output = triton_w4a16_skinny_fmt_gemm(
@@ -308,24 +313,17 @@ def _hybrid_w4a16_apply_fake(
     group_size: int,
     zp_bias: int,
 ) -> torch.Tensor:
-    N = x_2d.size(0)
-    M = w_q.size(0)
-    return torch.empty((N, M), dtype=x_2d.dtype, device=x_2d.device)
+    M = x_2d.size(0)
+    N = w_q.size(0)
+    return torch.empty((M, N), dtype=x_2d.dtype, device=x_2d.device)
 
 
-def _register_hybrid_w4a16_op():
-    lib = torch.library.Library("_rocm_hybrid", "DEF")
-    lib.define(
-        "w4a16_apply(Tensor x_2d, Tensor w_q, Tensor w_s,"
-        " Tensor w_q_i32, Tensor? bias,"
-        " int cu_count, int group_size, int zp_bias) -> Tensor"
-    )
-    lib.impl("w4a16_apply", _hybrid_w4a16_apply_impl, "CUDA")
-    lib.impl("w4a16_apply", _hybrid_w4a16_apply_fake, "Meta")
-    return lib
-
-
-_HYBRID_W4A16_LIB = _register_hybrid_w4a16_op()
+direct_register_custom_op(
+    op_name="hybrid_w4a16_apply",
+    op_func=_hybrid_w4a16_apply_impl,
+    mutates_args=[],
+    fake_impl=_hybrid_w4a16_apply_fake,
+)
 
 
 class HybridW4A16LinearKernel(MPLinearKernel):
@@ -408,8 +406,8 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         shuffled = pack_int4_exllama_shuffle(unpacked)
 
         # Store as int8 for skinny kernel, keep int32 view for triton kernel
-        w_q_skinny = shuffled.contiguous().view(torch.int8).contiguous()
         w_q_skinny_i32 = shuffled.contiguous()
+        w_q_skinny = w_q_skinny_i32.view(torch.int8)
 
         # ---- Prepare skinny scales: [N, K//G] ----
         w_s_skinny = w_s_raw.data.contiguous()
@@ -439,21 +437,21 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         w_q_i32 = layer._hybrid_w_q_i32
 
         x_2d = x.reshape(-1, x.shape[-1])
-        N = x_2d.shape[0]
+        M = x_2d.shape[0]
         K = x_2d.shape[1]
-        M_out = w_q.shape[0]
-        out_shape = x.shape[:-1] + (M_out,)
+        N = w_q.shape[0]
+        out_shape = x.shape[:-1] + (N,)
 
         zp_bias = c.weight_type.bias if c.weight_type.has_bias() else 0
 
         ctx = (
             nullcontext()
             if torch.compiler.is_compiling()
-            else torch.profiler.record_function(f"hybrid_w4a16 {N}x{M_out}x{K}")
+            else torch.profiler.record_function(f"hybrid_w4a16 {M}x{N}x{K}")
         )
         with ctx:
             cu_count = num_compute_units()
-            output = torch.ops._rocm_hybrid.w4a16_apply(
+            output = torch.ops.vllm.hybrid_w4a16_apply(
                 x_2d,
                 w_q,
                 w_s,
