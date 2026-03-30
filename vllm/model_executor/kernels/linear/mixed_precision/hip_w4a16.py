@@ -10,7 +10,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     awq_pack,
     unpack_quantized_values_into_int32,
 )
-from vllm.model_executor.parameter import BasevLLMParameter
+from vllm.model_executor.parameter import (
+    BasevLLMParameter,
+    permute_param_layout_,
+)
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
@@ -93,10 +96,6 @@ class HipW4A16LinearKernel(MPLinearKernel):
 
         return True, None
 
-    # note assumes that
-    #  `weight_packed` is: {input_dim = 0, output_dim = 1, packed_dim = 0}
-    #  `weight_scale` is: {input_dim = 0, output_dim = 1}
-    #  `weight_zero_point` is: {input_dim = 1, output_dim = 0, packed_dim = 0}
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         self._validate_layer_invariants(layer)
         c = self.config
@@ -147,13 +146,12 @@ class HipW4A16LinearKernel(MPLinearKernel):
 
         def transform_w_q(x):
             assert isinstance(x, BasevLLMParameter)
-            w_unpacked = (
-                unpack_quantized_values_into_int32(
-                    x.data, self.config.weight_type, packed_dim=x.packed_dim
-                )
-                .t()
-                .contiguous()
-            )
+            # Normalize to (K//pack, N) with packed_dim=0 regardless of
+            # whether the source is compressed-tensors or AWQ.
+            permute_param_layout_(x, input_dim=0, output_dim=1, packed_dim=0)
+            w_unpacked = unpack_quantized_values_into_int32(
+                x.data, self.config.weight_type, packed_dim=0
+            ).contiguous()
             if should_pad:
                 w_unpacked_padded = torch.zeros(
                     (padded_k, N),
@@ -186,15 +184,18 @@ class HipW4A16LinearKernel(MPLinearKernel):
 
         def transform_w_s(x):
             assert isinstance(x, BasevLLMParameter)
+            # Normalize to (G, N) with input_dim=0 regardless of source.
+            permute_param_layout_(x, input_dim=0, output_dim=1)
+            data = x.data
             if pad_groups:
                 w_s_padded = torch.zeros(
                     (padded_groups, N),
-                    dtype=x.data.dtype,
-                    device=x.data.device,
+                    dtype=data.dtype,
+                    device=data.device,
                 )
-                w_s_padded[:num_groups].copy_(x.data.t())
+                w_s_padded[:num_groups].copy_(data)
                 return w_s_padded
-            return x.data.t().contiguous()
+            return data.contiguous()
 
         self._transform_param(layer, self.w_q_name, transform_w_q)
         if self.config.zero_points:
