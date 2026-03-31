@@ -1140,7 +1140,7 @@ torch::Tensor wvSplitK_int4_g_zp(const at::Tensor& in_a, const at::Tensor& in_b,
   }
 
 #define WVSPLITK_INT4G_ZP(_YTILE, _UNRL, _N, _GS)        \
-  if (is_gfx11_int4())                                   \
+  if (is_gfx1x_int4())                                   \
     WVSPLITK_INT4G_ZP_LAUNCH(32, _YTILE, _UNRL, _N, _GS) \
   else                                                   \
     WVSPLITK_INT4G_ZP_LAUNCH(64, _YTILE, _UNRL, _N, _GS)
