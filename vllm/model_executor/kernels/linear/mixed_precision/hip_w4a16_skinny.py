@@ -8,7 +8,10 @@ import torch
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     unpack_quantized_values_into_int32,
 )
-from vllm.model_executor.parameter import BasevLLMParameter
+from vllm.model_executor.parameter import (
+    BasevLLMParameter,
+    permute_param_layout_,
+)
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
@@ -21,6 +24,7 @@ def _w4a16_apply_impl(
     x_2d: torch.Tensor,
     w_q: torch.Tensor,
     w_s: torch.Tensor,
+    w_zp: torch.Tensor | None,
     w_dequant: torch.Tensor | None,
     bias: torch.Tensor | None,
     cu_count: int,
@@ -37,7 +41,11 @@ def _w4a16_apply_impl(
     K = x_2d.shape[1]
 
     if N <= SKINNY_GEMM_MAX_N and K * N <= LDS_CAPACITY_ELEMENTS:
-        if group_size > 0:
+        if w_zp is not None and group_size > 0:
+            return ops.wvSplitK_int4_g_zp(
+                w_q, x_2d, w_s, w_zp, cu_count, group_size, bias
+            )
+        elif group_size > 0:
             return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, bias)
         else:
             return ops.wvSplitK_int4(w_q, x_2d, w_s, cu_count, bias)
@@ -52,6 +60,7 @@ def _w4a16_apply_fake(
     x_2d: torch.Tensor,
     w_q: torch.Tensor,
     w_s: torch.Tensor,
+    w_zp: torch.Tensor | None,
     w_dequant: torch.Tensor | None,
     bias: torch.Tensor | None,
     cu_count: int,
@@ -65,8 +74,9 @@ def _w4a16_apply_fake(
 def _register_w4a16_op():
     lib = torch.library.Library("_rocm_skinny", "DEF")
     lib.define(
-        "w4a16_apply(Tensor x_2d, Tensor w_q, Tensor w_s, Tensor? w_dequant,"
-        " Tensor? bias, int cu_count, int group_size) -> Tensor"
+        "w4a16_apply(Tensor x_2d, Tensor w_q, Tensor w_s, Tensor? w_zp,"
+        " Tensor? w_dequant, Tensor? bias, int cu_count, int group_size)"
+        " -> Tensor"
     )
     lib.impl("w4a16_apply", _w4a16_apply_impl, "CUDA")
     lib.impl("w4a16_apply", _w4a16_apply_fake, "Meta")
@@ -80,10 +90,11 @@ class HipW4A16SkinnyLinearKernel(MPLinearKernel):
     """W4A16 skinny GEMM for ROCm (gfx11) using packed int4 weights.
 
     Supports both per-channel (group_size=-1) and per-group (group_size=32/128)
-    symmetric quantization. Uses wvSplitK_int4/wvSplitK_int4_g for small batch
-    sizes where activations fit in LDS, with dequant+linear fallback for larger
-    batches. Wrapped as a custom op to avoid torch.compile issues with the
-    data-dependent N<=4 branch.
+    quantization, including symmetric (uint4b8) and asymmetric (uint4 with zero
+    points). Uses wvSplitK_int4/wvSplitK_int4_g/wvSplitK_int4_g_zp for small
+    batch sizes where activations fit in LDS, with dequant+linear fallback for
+    larger batches. Wrapped as a custom op to avoid torch.compile issues with
+    the data-dependent N<=4 branch.
     """
 
     @classmethod
@@ -109,8 +120,8 @@ class HipW4A16SkinnyLinearKernel(MPLinearKernel):
         if c.group_size not in (-1, 32, 128):
             return False, f"group_size must be -1, 32, or 128 (got {c.group_size})"
 
-        if c.zero_points:
-            return False, "does not support zero points (asymmetric)"
+        if c.zero_points and c.group_size == -1:
+            return False, "zero points require per-group quantization"
 
         if c.has_g_idx:
             return False, "does not support g_idx reordering"
@@ -130,6 +141,7 @@ class HipW4A16SkinnyLinearKernel(MPLinearKernel):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         c = self.config
         K = c.partition_weight_shape[0]
+        M = c.partition_weight_shape[1]  # output features
 
         # Dequantize from the raw unpacked representation *before* repacking
         # into the kernel-specific layout. This is simpler than reversing the
@@ -138,20 +150,55 @@ class HipW4A16SkinnyLinearKernel(MPLinearKernel):
         unpacked = unpack_quantized_values_into_int32(
             w_q_raw.data, c.weight_type, packed_dim=w_q_raw.packed_dim
         )
-        bias_val = c.weight_type.bias
-        w_fp = (unpacked - bias_val).to(c.act_type)
+        # Normalize to (M, K) regardless of source layout.
+        # AWQ-converted weights arrive as (K, N) with output_dim=1,
+        # compressed-tensors arrive as (N, K) with output_dim=0.
+        if getattr(w_q_raw, "output_dim", 0) != 0:
+            unpacked = unpacked.t().contiguous()
 
-        w_s_clean = w_s_raw.data
+        # Normalize scales to (M, num_groups) or (M, 1).
+        w_s_raw_data = w_s_raw.data
+        if getattr(w_s_raw, "output_dim", 0) != 0:
+            w_s_raw_data = w_s_raw_data.t().contiguous()
+        w_s_clean = w_s_raw_data
         if c.group_size == -1:
             w_s_clean = w_s_clean.squeeze(-1)
         w_s_clean = w_s_clean.contiguous()
 
-        if c.group_size > 0:
+        # Process zero points for asymmetric quantization
+        self._w_zp = None
+        if c.zero_points:
+            assert self.w_zp_name is not None
+            w_zp_raw = getattr(layer, self.w_zp_name)
+            # Normalize zp layout to (M, num_groups) via permute_param_layout_
+            permute_param_layout_(w_zp_raw, input_dim=1, output_dim=0, packed_dim=0)
+            zp_unpacked = unpack_quantized_values_into_int32(
+                w_zp_raw.data, c.weight_type, packed_dim=0
+            )
+            # zp_unpacked: [M, num_groups]
             num_groups = K // c.group_size
-            w_fp = w_fp.view(w_fp.shape[0], num_groups, c.group_size)
-            w_fp = (w_fp * w_s_clean.unsqueeze(-1)).view(w_fp.shape[0], K)
+
+            # The kernel dequant always produces (nibble - 8). To get
+            # (nibble - zp_raw), we subtract (zp_raw - 8) after dequant.
+            self._w_zp = (zp_unpacked - 8).to(c.act_type).contiguous()
+
+            # Build dequant fallback with zero-point subtraction
+            zp_expanded = zp_unpacked.to(c.act_type)
+            zp_expanded = zp_expanded.unsqueeze(-1).expand(-1, num_groups, c.group_size)
+            w_fp = unpacked.to(c.act_type).view(M, num_groups, c.group_size)
+            w_fp = (w_fp - zp_expanded) * w_s_clean.unsqueeze(-1)
+            w_fp = w_fp.view(M, K)
         else:
-            w_fp = w_fp * w_s_clean.unsqueeze(1)
+            bias_val = c.weight_type.bias
+            w_fp = (unpacked - bias_val).to(c.act_type)
+
+            if c.group_size > 0:
+                num_groups = K // c.group_size
+                w_fp = w_fp.view(M, num_groups, c.group_size)
+                w_fp = (w_fp * w_s_clean.unsqueeze(-1)).view(M, K)
+            else:
+                w_fp = w_fp * w_s_clean.unsqueeze(1)
+
         self._w_dequant = w_fp.contiguous()
 
         # Now repack w_q / w_s into the format the skinny GEMM kernel expects.
@@ -159,6 +206,9 @@ class HipW4A16SkinnyLinearKernel(MPLinearKernel):
             unpacked = unpack_quantized_values_into_int32(
                 x.data, c.weight_type, packed_dim=x.packed_dim
             )
+            # Normalize to (M, K)
+            if getattr(x, "output_dim", 0) != 0:
+                unpacked = unpacked.t().contiguous()
             if c.act_type == torch.float16:
                 unsigned = unpacked.to(torch.uint8)
                 M, K_dim = unsigned.shape
@@ -175,8 +225,14 @@ class HipW4A16SkinnyLinearKernel(MPLinearKernel):
                 )
                 return shuffled.contiguous().view(torch.int8).contiguous()
             else:
-                bias_val = c.weight_type.bias
-                signed = (unpacked - bias_val).to(torch.int8)
+                # The bf16 kernel extracts nibbles as signed 4-bit
+                # values via arithmetic shift, which maps unsigned
+                # [0..15] → signed [-8..+7] (two's complement).
+                # We must always subtract 8 before packing so the
+                # kernel recovers the intended signed value,
+                # regardless of weight_type.bias (uint4 has bias=0,
+                # uint4b8 has bias=8).
+                signed = (unpacked - 8).to(torch.int8)
                 M, K_dim = signed.shape
                 low = signed[:, 0::2] & 0xF
                 high = signed[:, 1::2] & 0xF
@@ -184,9 +240,13 @@ class HipW4A16SkinnyLinearKernel(MPLinearKernel):
                 return packed.view(torch.int8).contiguous()
 
         def transform_w_s(x: BasevLLMParameter) -> torch.Tensor:
+            data = x.data
+            # Normalize to (M, num_groups)
+            if getattr(x, "output_dim", 0) != 0:
+                data = data.t().contiguous()
             if c.group_size == -1:
-                return x.data.squeeze(-1).contiguous()
-            return x.data.contiguous()
+                return data.squeeze(-1).contiguous()
+            return data.contiguous()
 
         self._transform_param(layer, self.w_q_name, transform_w_q)
         self._transform_param(layer, self.w_s_name, transform_w_s)
@@ -217,6 +277,7 @@ class HipW4A16SkinnyLinearKernel(MPLinearKernel):
                 x_2d,
                 w_q,
                 w_s,
+                self._w_zp,
                 self._w_dequant,
                 bias,
                 cu_count,
