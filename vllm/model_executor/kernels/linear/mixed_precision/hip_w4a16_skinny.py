@@ -209,35 +209,24 @@ class HipW4A16SkinnyLinearKernel(MPLinearKernel):
             # Normalize to (M, K)
             if getattr(x, "output_dim", 0) != 0:
                 unpacked = unpacked.t().contiguous()
-            if c.act_type == torch.float16:
-                unsigned = unpacked.to(torch.uint8)
-                M, K_dim = unsigned.shape
-                g = unsigned.view(M, K_dim // 8, 8).to(torch.int32)
-                shuffled = (
-                    g[:, :, 0]
-                    | (g[:, :, 2] << 4)
-                    | (g[:, :, 4] << 8)
-                    | (g[:, :, 6] << 12)
-                    | (g[:, :, 1] << 16)
-                    | (g[:, :, 3] << 20)
-                    | (g[:, :, 5] << 24)
-                    | (g[:, :, 7] << 28)
-                )
-                return shuffled.contiguous().view(torch.int8).contiguous()
-            else:
-                # The bf16 kernel extracts nibbles as signed 4-bit
-                # values via arithmetic shift, which maps unsigned
-                # [0..15] → signed [-8..+7] (two's complement).
-                # We must always subtract 8 before packing so the
-                # kernel recovers the intended signed value,
-                # regardless of weight_type.bias (uint4 has bias=0,
-                # uint4b8 has bias=8).
-                signed = (unpacked - 8).to(torch.int8)
-                M, K_dim = signed.shape
-                low = signed[:, 0::2] & 0xF
-                high = signed[:, 1::2] & 0xF
-                packed = (low | (high << 4)).to(torch.uint8)
-                return packed.view(torch.int8).contiguous()
+            # Both fp16 and bf16 kernels use ExLlama shuffle format:
+            # 8 unsigned int4 values packed per uint32 as
+            # [v0,v2,v4,v6] in low 16 bits, [v1,v3,v5,v7] in high.
+            # The kernel subtracts 8 from each nibble during dequant.
+            unsigned = unpacked.to(torch.uint8)
+            M, K_dim = unsigned.shape
+            g = unsigned.view(M, K_dim // 8, 8).to(torch.int32)
+            shuffled = (
+                g[:, :, 0]
+                | (g[:, :, 2] << 4)
+                | (g[:, :, 4] << 8)
+                | (g[:, :, 6] << 12)
+                | (g[:, :, 1] << 16)
+                | (g[:, :, 3] << 20)
+                | (g[:, :, 5] << 24)
+                | (g[:, :, 7] << 28)
+            )
+            return shuffled.contiguous().view(torch.int8).contiguous()
 
         def transform_w_s(x: BasevLLMParameter) -> torch.Tensor:
             data = x.data
