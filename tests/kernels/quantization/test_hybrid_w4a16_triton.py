@@ -120,7 +120,7 @@ def _w4a16_skinny_reference_asymmetric(
     a_mk: torch.Tensor,
     w_int4_kn: torch.Tensor,
     scales_nkg: torch.Tensor,
-    zp_adj_nkg: torch.Tensor,
+    zp_raw_nkg: torch.Tensor,
     *,
     group_size: int,
 ) -> torch.Tensor:
@@ -129,17 +129,17 @@ def _w4a16_skinny_reference_asymmetric(
     a_mk: [M, K] fp16/bf16
     w_int4_kn: [K, N] int4 values (unpacked, int32)
     scales_nkg: [N, K//G] scales (skinny layout)
-    zp_adj_nkg: [N, K//G] adjusted zero-points (zp_raw - 8) in activation dtype
+    zp_raw_nkg: [N, K//G] raw zero-points in activation dtype
     """
-    # Expand scales and adjusted zp from [N, K//G] to [K, N]
+    # Expand scales and raw zp from [N, K//G] to [K, N]
     scales_kn = scales_nkg.t().contiguous()  # [K//G, N]
     s_full = scales_kn.repeat_interleave(group_size, dim=0).to(torch.float32)
 
-    zp_adj_kn = zp_adj_nkg.t().contiguous()  # [K//G, N]
-    zp_adj_full = zp_adj_kn.repeat_interleave(group_size, dim=0).to(torch.float32)
+    zp_raw_kn = zp_raw_nkg.t().contiguous()  # [K//G, N]
+    zp_raw_full = zp_raw_kn.repeat_interleave(group_size, dim=0).to(torch.float32)
 
-    # dequant: ((w - 8) - zp_adj) * scale = (w - zp_raw) * scale
-    w_fp = (w_int4_kn.to(torch.float32) - 8.0 - zp_adj_full) * s_full  # [K, N]
+    # dequant: (nibble - zp_raw) * scale
+    w_fp = (w_int4_kn.to(torch.float32) - zp_raw_full) * s_full  # [K, N]
     out = a_mk.to(torch.float32) @ w_fp  # [M, N]
     return out.to(a_mk.dtype)
 
@@ -174,22 +174,22 @@ def test_triton_w4a16_skinny_fmt_gemm_asymmetric(dtype, M, K, N, G, random_seed:
         dtype
     )
 
-    # Adjusted per-group zero-points [N, K//G]: (zp_raw - 8) in activation dtype
+    # Raw per-group zero-points [N, K//G] in activation dtype
     zp_raw = torch.randint(0, 16, (N, K // G), device=device, dtype=torch.int32)
-    zp_adj = (zp_raw - 8).to(dtype)
+    zp = zp_raw.to(dtype)
 
     out = triton_w4a16_skinny_fmt_gemm(
         a=a,
         b_q=b_packed,
         scales=scales,
         group_size=G,
-        zp=zp_adj,
+        zp=zp,
     )
     ref = _w4a16_skinny_reference_asymmetric(
         a,
         w_int4,
         scales,
-        zp_adj,
+        zp,
         group_size=G,
     )
 

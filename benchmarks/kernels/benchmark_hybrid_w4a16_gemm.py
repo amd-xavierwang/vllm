@@ -54,10 +54,10 @@ def prepare_hybrid_weights(K, N, group_size, device="cuda"):
     w_q_skinny = w_q_skinny_i32.view(torch.int8).contiguous()
     w_s_skinny = torch.randn(N, num_groups, dtype=torch.float16, device=device) * 0.01
 
-    # Adjusted per-group zero-points (zp_raw - 8) for asymmetric benchmarks
-    w_zp = (
-        torch.randint(0, 16, (N, num_groups), dtype=torch.int32, device=device) - 8
-    ).to(torch.float16)
+    # Raw per-group zero-points for asymmetric benchmarks
+    w_zp = torch.randint(0, 16, (N, num_groups), dtype=torch.int32, device=device).to(
+        torch.float16
+    )
 
     # FP16 baseline for F.linear
     w_fp16 = torch.randn(N, K, dtype=torch.float16, device=device) * 0.01

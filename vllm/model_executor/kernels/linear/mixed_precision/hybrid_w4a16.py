@@ -50,7 +50,7 @@ def _triton_w4a16_skinny_fmt_kernel(
     a_ptr,  # [M, K]  fp16/bf16 activations
     b_ptr,  # [N, K//8]  int32 packed (ExLlama shuffle, K is packed dim)
     scales_ptr,  # [N, K//G]  fp16/bf16 scales (skinny layout)
-    zp_ptr,  # [N, K//G]  fp16/bf16 zero-points (when HAS_ZP=True)
+    zp_ptr,  # [N, K//G]  fp16/bf16 raw zero-points (when HAS_ZP=True)
     c_ptr,  # [M, N]  fp16/bf16 output
     # Dimensions
     M,
@@ -76,8 +76,8 @@ def _triton_w4a16_skinny_fmt_kernel(
                | (val[1]<<16) | (val[3]<<20) | (val[5]<<24) | (val[7]<<28)
 
     Scales are [N, K//G] (skinny layout, NOT transposed).
-    When HAS_ZP=True, adjusted zero-points (zp_raw - 8) are loaded from
-    zp_ptr [N, K//G] and subtracted after the constant ZP_BIAS shift.
+    When HAS_ZP=True, raw zero-points zp_raw are loaded from zp_ptr [N, K//G]
+    and subtracted directly: (nibble - zp_raw) * scale.
     When HAS_ZP=False, only the constant ZP_BIAS is subtracted (symmetric).
     """
     pid_m = tl.program_id(0)
@@ -126,16 +126,15 @@ def _triton_w4a16_skinny_fmt_kernel(
         scale_mask = offs_n < N
         scales = tl.load(scale_ptrs, mask=scale_mask, other=1.0)
 
-        # ---- Dequantize: (w - 8) in int, then float adjust ----
-        b_fp = (b - ZP_BIAS).to(scales.dtype)
+        # ---- Dequantize ----
         if HAS_ZP:
-            # Asymmetric: subtract adjusted zp (zp_raw - 8)
+            # Asymmetric: (nibble - zp_raw) * scale (single subtraction)
             zp_ptrs = zp_ptr + offs_n * num_groups + g_idx
-            zp_adj = tl.load(zp_ptrs, mask=scale_mask, other=0.0)
-            b_fp = (b_fp - zp_adj[:, None]) * scales[:, None]
+            zp_raw = tl.load(zp_ptrs, mask=scale_mask, other=0.0)
+            b_fp = (b.to(scales.dtype) - zp_raw[:, None]) * scales[:, None]
         else:
             # Symmetric: (w - 8) * scale
-            b_fp = b_fp * scales[:, None]
+            b_fp = (b - ZP_BIAS).to(scales.dtype) * scales[:, None]
 
         # ---- Transpose to [BLOCK_K, BLOCK_N] for matmul ----
         b_fp_t = tl.trans(b_fp)
@@ -167,9 +166,9 @@ def triton_w4a16_skinny_fmt_gemm(
         scales:     Per-group scales [N, K//G], same dtype as a.
         group_size: Quantization group size (resolved from -1 to K by caller).
         zp_bias:    Constant zero bias (default 8 for unsigned int4).
-        zp:         Adjusted per-group zero-points [N, K//G] (asymmetric),
-                    stored as (zp_raw - 8) in activation dtype. When provided,
-                    dequant is ((w - 8) - zp_adj) * scale = (w - zp_raw) * scale.
+        zp:         Raw per-group zero-points [N, K//G] (asymmetric),
+                    stored as zp_raw in activation dtype. When provided,
+                    dequant is (nibble - zp_raw) * scale.
 
     Returns:
         Output matrix [M, N], same dtype as a.
@@ -306,9 +305,9 @@ def _hybrid_w4a16_apply_impl(
       w_q:     [N, K//8] int8 (ExLlama shuffle, for skinny kernel)
       w_q_i32: [N, K//8] int32 (same data viewed as int32, for triton)
       w_s:     [N, K//G] fp16/bf16 (skinny-layout scales)
-      w_zp:    [N, K//G] adjusted zero-points (zp_raw - 8) in act dtype,
+      w_zp:    [N, K//G] raw zero-points (zp_raw) in act dtype,
                or None for symmetric. Both HIP skinny and Triton use this
-               single format.
+               single format: dequant = (nibble - zp_raw) * scale.
 
     Registered as a custom op so torch.compile treats it as opaque.
     """
@@ -471,11 +470,9 @@ class HybridW4A16LinearKernel(MPLinearKernel):
                 w_zp_raw.data, c.weight_type, packed_dim=0
             )
             # zp_unpacked: [N, num_groups] with raw uint4 values [0..15]
-            # Store adjusted zero-points (zp_raw - 8) in activation dtype.
-            # Both kernels use this format:
-            #   HIP skinny: expects (zp - 8) because it computes (nibble - 8)
-            #   Triton: computes (b - 8) then subtracts zp_adj
-            w_zp = (zp_unpacked - 8).to(c.act_type).contiguous()
+            # Store raw zero-points in activation dtype.
+            # Both kernels dequant as (nibble - zp_raw) * scale.
+            w_zp = zp_unpacked.to(c.act_type).contiguous()
             self._transform_param(layer, self.w_zp_name, lambda x: w_zp)
 
         # ---- Store on layer ----
