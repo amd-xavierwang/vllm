@@ -234,9 +234,14 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 
             if constexpr (std::is_same_v<scalar_t, half>) {
               constexpr uint32_t FP16_MAGIC = 0x64006400u;
-              constexpr uint32_t BIAS_LO = 0x64086408u;
+              // When HAS_ZERO_POINTS, store raw nibble values;
+              // the zero-point subtraction below handles the full shift.
+              // When symmetric, bake -8 into the constants.
+              constexpr uint32_t BIAS_LO =
+                  HAS_ZERO_POINTS ? 0x64006400u : 0x64086408u;
               constexpr uint32_t SCALE16 = 0x2C002C00u;
-              constexpr uint32_t BIAS_HI = 0xD480D480u;
+              constexpr uint32_t BIAS_HI =
+                  HAS_ZERO_POINTS ? 0xD400D400u : 0xD480D480u;
   #pragma unroll
               for (uint32_t w = 0; w < A_CHUNK / 8; w++) {
                 uint32_t qa = bigB[y][k2].u32[w];
@@ -261,26 +266,35 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
               // ExLlama shuffle: 8 unsigned int4 values packed per uint32
               // Bit layout: [v0,v2,v4,v6] in low 16 bits,
               //             [v1,v3,v5,v7] in high 16 bits
+              // Symmetric uses a fixed zero point of -8.
+              constexpr int ZP_BIAS = HAS_ZERO_POINTS ? 0 : 8;
   #pragma unroll
               for (uint32_t w = 0; w < A_CHUNK / 8; w++) {
                 uint32_t qa = bigB[y][k2].u32[w];
-                cvtB.h[w * 8 + 0] = (scalar_t)((int)(qa & 0xF) - 8);
-                cvtB.h[w * 8 + 1] = (scalar_t)((int)((qa >> 16) & 0xF) - 8);
-                cvtB.h[w * 8 + 2] = (scalar_t)((int)((qa >> 4) & 0xF) - 8);
-                cvtB.h[w * 8 + 3] = (scalar_t)((int)((qa >> 20) & 0xF) - 8);
-                cvtB.h[w * 8 + 4] = (scalar_t)((int)((qa >> 8) & 0xF) - 8);
-                cvtB.h[w * 8 + 5] = (scalar_t)((int)((qa >> 24) & 0xF) - 8);
-                cvtB.h[w * 8 + 6] = (scalar_t)((int)((qa >> 12) & 0xF) - 8);
-                cvtB.h[w * 8 + 7] = (scalar_t)((int)((qa >> 28) & 0xF) - 8);
+                cvtB.h[w * 8 + 0] = (scalar_t)((int)(qa & 0xF) - ZP_BIAS);
+                cvtB.h[w * 8 + 1] =
+                    (scalar_t)((int)((qa >> 16) & 0xF) - ZP_BIAS);
+                cvtB.h[w * 8 + 2] =
+                    (scalar_t)((int)((qa >> 4) & 0xF) - ZP_BIAS);
+                cvtB.h[w * 8 + 3] =
+                    (scalar_t)((int)((qa >> 20) & 0xF) - ZP_BIAS);
+                cvtB.h[w * 8 + 4] =
+                    (scalar_t)((int)((qa >> 8) & 0xF) - ZP_BIAS);
+                cvtB.h[w * 8 + 5] =
+                    (scalar_t)((int)((qa >> 24) & 0xF) - ZP_BIAS);
+                cvtB.h[w * 8 + 6] =
+                    (scalar_t)((int)((qa >> 12) & 0xF) - ZP_BIAS);
+                cvtB.h[w * 8 + 7] =
+                    (scalar_t)((int)((qa >> 28) & 0xF) - ZP_BIAS);
               }
             }
 
             if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
               uint32_t group_idx = k_ / GROUP_SIZE;
-              scalar_t zp_adj = zero_points[(m + y) * num_groups + group_idx];
+              scalar_t zp = zero_points[(m + y) * num_groups + group_idx];
   #pragma unroll
               for (uint32_t b = 0; b < A_CHUNK; b++) {
-                cvtB.h[b] = cvtB.h[b] - zp_adj;
+                cvtB.h[b] = cvtB.h[b] - zp;
               }
             }
 
@@ -484,9 +498,14 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 
             if constexpr (std::is_same_v<scalar_t, half>) {
               constexpr uint32_t FP16_MAGIC = 0x64006400u;
-              constexpr uint32_t BIAS_LO = 0x64086408u;
+              // When HAS_ZERO_POINTS, store raw nibble values;
+              // the zero-point subtraction below handles the full shift.
+              // When symmetric, bake -8 into the constants.
+              constexpr uint32_t BIAS_LO =
+                  HAS_ZERO_POINTS ? 0x64006400u : 0x64086408u;
               constexpr uint32_t SCALE16 = 0x2C002C00u;
-              constexpr uint32_t BIAS_HI = 0xD480D480u;
+              constexpr uint32_t BIAS_HI =
+                  HAS_ZERO_POINTS ? 0xD400D400u : 0xD480D480u;
   #pragma unroll
               for (uint32_t w = 0; w < A_CHUNK / 8; w++) {
                 uint32_t qa = bigB[y][k2].u32[w];
@@ -511,26 +530,35 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
               // ExLlama shuffle: 8 unsigned int4 values packed per uint32
               // Bit layout: [v0,v2,v4,v6] in low 16 bits,
               //             [v1,v3,v5,v7] in high 16 bits
+              // Symmetric uses a fixed zero point of -8.
+              constexpr int ZP_BIAS = HAS_ZERO_POINTS ? 0 : 8;
   #pragma unroll
               for (uint32_t w = 0; w < A_CHUNK / 8; w++) {
                 uint32_t qa = bigB[y][k2].u32[w];
-                cvtB.h[w * 8 + 0] = (scalar_t)((int)(qa & 0xF) - 8);
-                cvtB.h[w * 8 + 1] = (scalar_t)((int)((qa >> 16) & 0xF) - 8);
-                cvtB.h[w * 8 + 2] = (scalar_t)((int)((qa >> 4) & 0xF) - 8);
-                cvtB.h[w * 8 + 3] = (scalar_t)((int)((qa >> 20) & 0xF) - 8);
-                cvtB.h[w * 8 + 4] = (scalar_t)((int)((qa >> 8) & 0xF) - 8);
-                cvtB.h[w * 8 + 5] = (scalar_t)((int)((qa >> 24) & 0xF) - 8);
-                cvtB.h[w * 8 + 6] = (scalar_t)((int)((qa >> 12) & 0xF) - 8);
-                cvtB.h[w * 8 + 7] = (scalar_t)((int)((qa >> 28) & 0xF) - 8);
+                cvtB.h[w * 8 + 0] = (scalar_t)((int)(qa & 0xF) - ZP_BIAS);
+                cvtB.h[w * 8 + 1] =
+                    (scalar_t)((int)((qa >> 16) & 0xF) - ZP_BIAS);
+                cvtB.h[w * 8 + 2] =
+                    (scalar_t)((int)((qa >> 4) & 0xF) - ZP_BIAS);
+                cvtB.h[w * 8 + 3] =
+                    (scalar_t)((int)((qa >> 20) & 0xF) - ZP_BIAS);
+                cvtB.h[w * 8 + 4] =
+                    (scalar_t)((int)((qa >> 8) & 0xF) - ZP_BIAS);
+                cvtB.h[w * 8 + 5] =
+                    (scalar_t)((int)((qa >> 24) & 0xF) - ZP_BIAS);
+                cvtB.h[w * 8 + 6] =
+                    (scalar_t)((int)((qa >> 12) & 0xF) - ZP_BIAS);
+                cvtB.h[w * 8 + 7] =
+                    (scalar_t)((int)((qa >> 28) & 0xF) - ZP_BIAS);
               }
             }
 
             if constexpr (HAS_ZERO_POINTS && GROUP_SIZE > 0) {
               uint32_t group_idx = k_ / GROUP_SIZE;
-              scalar_t zp_adj = zero_points[(m + y) * num_groups + group_idx];
+              scalar_t zp = zero_points[(m + y) * num_groups + group_idx];
   #pragma unroll
               for (uint32_t b = 0; b < A_CHUNK; b++) {
-                cvtB.h[b] = cvtB.h[b] - zp_adj;
+                cvtB.h[b] = cvtB.h[b] - zp;
               }
             }
 
@@ -1064,8 +1092,8 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_a, const at::Tensor& in_b,
 // in_a: packed int4 weights [M, K/2] (int8) or [M, K/8] (int32)
 // in_b: activations [N, K] (fp16/bf16)
 // in_scale: group scales [M, K/group_size] (fp16/bf16)
-// in_zero_points: pre-adjusted zero points [M, K/group_size] (fp16/bf16)
-//   Stores (zp_raw - 8) so kernel can subtract from bias-8 dequant directly.
+// in_zero_points: zero points [M, K/group_size] (fp16/bf16)
+// kernel dequants as (nibble - zp) * scale.
 // group_size: 32 or 128
 torch::Tensor wvSplitK_int4_g_zp(const at::Tensor& in_a, const at::Tensor& in_b,
                                  const at::Tensor& in_scale,

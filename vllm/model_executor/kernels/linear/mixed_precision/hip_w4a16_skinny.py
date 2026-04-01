@@ -178,9 +178,8 @@ class HipW4A16SkinnyLinearKernel(MPLinearKernel):
             # zp_unpacked: [M, num_groups]
             num_groups = K // c.group_size
 
-            # The kernel dequant always produces (nibble - 8). To get
-            # (nibble - zp_raw), we subtract (zp_raw - 8) after dequant.
-            self._w_zp = (zp_unpacked - 8).to(c.act_type).contiguous()
+            # Raw zero points: kernel dequants as (nibble - zp_raw) * scale.
+            self._w_zp = zp_unpacked.to(c.act_type).contiguous()
 
             # Build dequant fallback with zero-point subtraction
             zp_expanded = zp_unpacked.to(c.act_type)
