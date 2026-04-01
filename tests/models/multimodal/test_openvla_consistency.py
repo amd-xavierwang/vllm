@@ -30,11 +30,11 @@ ACTION_TOKEN_MAX = 31999
 
 # Reference tokens captured from vLLM (gfx1151, bfloat16, seed=42, temp=0).
 REFERENCE_TOKENS: dict[str, list[int]] = {
-    "pick up the red block": [31884, 31824, 31872, 31808, 31811, 31883, 31872],
+    "pick up the red block": [31884, 31824, 31872, 31808, 31815, 31768, 31872],
     "move the cube to the left": [31867, 31843, 31951, 31842, 31810, 31880, 31872],
-    "push the ball forward": [31782, 31810, 31999, 31893, 31868, 31860, 31744],
+    "push the ball forward": [31782, 31810, 31999, 31893, 31856, 31827, 31744],
     "place the object on the table": [31873, 31829, 31887, 31862, 31839, 31851, 31744],
-    "grasp the yellow cylinder": [31782, 31882, 31980, 31897, 31861, 31893, 31744],
+    "grasp the yellow cylinder": [31884, 31871, 31917, 31882, 31850, 31848, 31744],
 }
 
 INSTRUCTIONS = list(REFERENCE_TOKENS.keys())
