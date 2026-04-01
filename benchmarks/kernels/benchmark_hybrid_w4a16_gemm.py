@@ -54,16 +54,21 @@ def prepare_hybrid_weights(K, N, group_size, device="cuda"):
     w_q_skinny = w_q_skinny_i32.view(torch.int8).contiguous()
     w_s_skinny = torch.randn(N, num_groups, dtype=torch.float16, device=device) * 0.01
 
+    # Adjusted per-group zero-points (zp_raw - 8) for asymmetric benchmarks
+    w_zp = (
+        torch.randint(0, 16, (N, num_groups), dtype=torch.int32, device=device) - 8
+    ).to(torch.float16)
+
     # FP16 baseline for F.linear
     w_fp16 = torch.randn(N, K, dtype=torch.float16, device=device) * 0.01
 
-    return w_q_skinny, w_s_skinny, w_fp16, w_q_skinny_i32
+    return w_q_skinny, w_s_skinny, w_fp16, w_q_skinny_i32, w_zp
 
 
 # ---------------------------------------------------------------------------
 # Benchmark
 # ---------------------------------------------------------------------------
-PROVIDERS = ["torch-fp16", "hybrid-w4a16"]
+PROVIDERS = ["torch-fp16", "hybrid-w4a16", "hybrid-w4a16-zp"]
 
 
 @triton.testing.perf_report(
@@ -93,7 +98,7 @@ def benchmark(batch_size, provider, N, K, group_size, weights):
             lambda: torch.nn.functional.linear(a, w_fp16),
             quantiles=quantiles,
         )
-    elif provider == "hybrid-w4a16":
+    elif provider in ("hybrid-w4a16", "hybrid-w4a16-zp"):
         from vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16 import (
             _hybrid_w4a16_apply_impl,
         )
@@ -101,6 +106,7 @@ def benchmark(batch_size, provider, N, K, group_size, weights):
 
         w = weights
         cu_count = num_compute_units()
+        use_zp = provider == "hybrid-w4a16-zp"
 
         def run():
             return _hybrid_w4a16_apply_impl(
@@ -108,10 +114,10 @@ def benchmark(batch_size, provider, N, K, group_size, weights):
                 w["w_q_skinny"],
                 w["w_s_skinny"],
                 w["w_q_skinny_i32"],
+                w["w_zp"] if use_zp else None,
                 None,  # bias
                 cu_count,
                 group_size,
-                8,  # zp_bias
             )
 
         ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(
@@ -155,7 +161,7 @@ if __name__ == "__main__":
         print(f"{model}, N={N} K={K}, group_size={group_size}")
         print(f"{'=' * 70}")
 
-        w_q_skinny, w_s_skinny, w_fp16, w_q_skinny_i32 = prepare_hybrid_weights(
+        w_q_skinny, w_s_skinny, w_fp16, w_q_skinny_i32, w_zp = prepare_hybrid_weights(
             K, N, group_size
         )
 
@@ -164,6 +170,7 @@ if __name__ == "__main__":
             "w_s_skinny": w_s_skinny,
             "w_fp16": w_fp16,
             "w_q_skinny_i32": w_q_skinny_i32,
+            "w_zp": w_zp,
         }
 
         save_path = args.save_path or f"bench_int4_res_n{N}_k{K}"

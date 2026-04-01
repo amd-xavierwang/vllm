@@ -19,6 +19,9 @@ import torch
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     unpack_quantized_values_into_int32,
 )
+from vllm.model_executor.parameter import (
+    permute_param_layout_,
+)
 from vllm.platforms import current_platform
 from vllm.platforms.rocm import on_gfx1x
 from vllm.scalar_type import scalar_types
@@ -47,6 +50,7 @@ def _triton_w4a16_skinny_fmt_kernel(
     a_ptr,  # [M, K]  fp16/bf16 activations
     b_ptr,  # [N, K//8]  int32 packed (ExLlama shuffle, K is packed dim)
     scales_ptr,  # [N, K//G]  fp16/bf16 scales (skinny layout)
+    zp_ptr,  # [N, K//G]  fp16/bf16 zero-points (when HAS_ZP=True)
     c_ptr,  # [M, N]  fp16/bf16 output
     # Dimensions
     M,
@@ -57,6 +61,7 @@ def _triton_w4a16_skinny_fmt_kernel(
     # Quantization parameters
     group_size,
     ZP_BIAS: tl.constexpr,
+    HAS_ZP: tl.constexpr,
     # Block sizes
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -71,6 +76,9 @@ def _triton_w4a16_skinny_fmt_kernel(
                | (val[1]<<16) | (val[3]<<20) | (val[5]<<24) | (val[7]<<28)
 
     Scales are [N, K//G] (skinny layout, NOT transposed).
+    When HAS_ZP=True, adjusted zero-points (zp_raw - 8) are loaded from
+    zp_ptr [N, K//G] and subtracted after the constant ZP_BIAS shift.
+    When HAS_ZP=False, only the constant ZP_BIAS is subtracted (symmetric).
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -118,8 +126,16 @@ def _triton_w4a16_skinny_fmt_kernel(
         scale_mask = offs_n < N
         scales = tl.load(scale_ptrs, mask=scale_mask, other=1.0)
 
-        # ---- Dequantize: (w - zp_bias) * scale -> [BLOCK_N, BLOCK_K] ----
-        b_fp = (b - ZP_BIAS).to(scales.dtype) * scales[:, None]
+        # ---- Dequantize: (w - 8) in int, then float adjust ----
+        b_fp = (b - ZP_BIAS).to(scales.dtype)
+        if HAS_ZP:
+            # Asymmetric: subtract adjusted zp (zp_raw - 8)
+            zp_ptrs = zp_ptr + offs_n * num_groups + g_idx
+            zp_adj = tl.load(zp_ptrs, mask=scale_mask, other=0.0)
+            b_fp = (b_fp - zp_adj[:, None]) * scales[:, None]
+        else:
+            # Symmetric: (w - 8) * scale
+            b_fp = b_fp * scales[:, None]
 
         # ---- Transpose to [BLOCK_K, BLOCK_N] for matmul ----
         b_fp_t = tl.trans(b_fp)
@@ -140,6 +156,7 @@ def triton_w4a16_skinny_fmt_gemm(
     scales: torch.Tensor,  # [N, K//G] fp16/bf16
     group_size: int,
     zp_bias: int = 8,
+    zp: torch.Tensor | None = None,  # [N, K//G] per-group zero-points
 ) -> torch.Tensor:
     """
     Fused W4A16 GEMM reading from skinny weight format [N, K//8].
@@ -149,7 +166,10 @@ def triton_w4a16_skinny_fmt_gemm(
         b_q:        Packed weight matrix [N, K//8], int32 (ExLlama shuffle).
         scales:     Per-group scales [N, K//G], same dtype as a.
         group_size: Quantization group size (resolved from -1 to K by caller).
-        zp_bias:    Constant zero bias (default 8 for uint4b8 symmetric).
+        zp_bias:    Constant zero bias (default 8 for unsigned int4).
+        zp:         Adjusted per-group zero-points [N, K//G] (asymmetric),
+                    stored as (zp_raw - 8) in activation dtype. When provided,
+                    dequant is ((w - 8) - zp_adj) * scale = (w - zp_raw) * scale.
 
     Returns:
         Output matrix [M, N], same dtype as a.
@@ -167,6 +187,12 @@ def triton_w4a16_skinny_fmt_gemm(
     assert scales.shape == (N, num_groups), (
         f"scales shape mismatch: {scales.shape} vs ({N}, {num_groups})"
     )
+    if zp is not None:
+        assert zp.is_contiguous(), "Zero-points must be contiguous"
+        assert zp.shape == (N, num_groups), (
+            f"zp shape mismatch: {zp.shape} vs ({N}, {num_groups})"
+        )
+    has_zp = zp is not None
 
     c = torch.empty((M, N), dtype=a.dtype, device=a.device)
 
@@ -216,6 +242,7 @@ def triton_w4a16_skinny_fmt_gemm(
         a,
         b_q,
         scales,
+        zp if has_zp else scales,  # dummy pointer when no zp (unused)
         c,
         M,
         N,
@@ -224,6 +251,7 @@ def triton_w4a16_skinny_fmt_gemm(
         num_groups,
         group_size=group_size,
         ZP_BIAS=zp_bias,
+        HAS_ZP=has_zp,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_K=BLOCK_K,
@@ -267,17 +295,20 @@ def _hybrid_w4a16_apply_impl(
     w_q: torch.Tensor,
     w_s: torch.Tensor,
     w_q_i32: torch.Tensor,
+    w_zp: torch.Tensor | None,
     bias: torch.Tensor | None,
     cu_count: int,
     group_size: int,
-    zp_bias: int,
 ) -> torch.Tensor:
     """Dispatch between skinny GEMM and Triton based on batch size M.
 
     Both paths read from the same skinny-format weights:
       w_q:     [N, K//8] int8 (ExLlama shuffle, for skinny kernel)
-      w_q_i32: [N, K//8] int32 (same data viewed as int32, for triton kernel)
-      w_s:     [N, K//G] fp16 (skinny-layout scales)
+      w_q_i32: [N, K//8] int32 (same data viewed as int32, for triton)
+      w_s:     [N, K//G] fp16/bf16 (skinny-layout scales)
+      w_zp:    [N, K//G] adjusted zero-points (zp_raw - 8) in act dtype,
+               or None for symmetric. Both HIP skinny and Triton use this
+               single format.
 
     Registered as a custom op so torch.compile treats it as opaque.
     """
@@ -296,7 +327,7 @@ def _hybrid_w4a16_apply_impl(
             else torch.profiler.record_function(f"wvsplitk_int4 {M}x{N}x{K}")
         )
         with ctx:
-            return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, None, bias)
+            return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, w_zp, bias)
 
     ctx = (
         nullcontext()
@@ -309,7 +340,7 @@ def _hybrid_w4a16_apply_impl(
             b_q=w_q_i32,
             scales=w_s,
             group_size=group_size,
-            zp_bias=zp_bias,
+            zp=w_zp,
         )
         if bias is not None:
             output.add_(bias)
@@ -321,10 +352,10 @@ def _hybrid_w4a16_apply_fake(
     w_q: torch.Tensor,
     w_s: torch.Tensor,
     w_q_i32: torch.Tensor,
+    w_zp: torch.Tensor | None,
     bias: torch.Tensor | None,
     cu_count: int,
     group_size: int,
-    zp_bias: int,
 ) -> torch.Tensor:
     M = x_2d.size(0)
     N = w_q.size(0)
@@ -349,6 +380,7 @@ class HybridW4A16LinearKernel(MPLinearKernel):
 
     SUPPORTED_QUANT_TYPES = [
         scalar_types.uint4b8,  # symmetric GPTQ (bias=8)
+        scalar_types.uint4,  # asymmetric (zero_points)
     ]
 
     @classmethod
@@ -366,6 +398,8 @@ class HybridW4A16LinearKernel(MPLinearKernel):
                 torch.ops._rocm_C, "wvSplitK_int4_g"
             ):
                 return False, "wvSplitK_int4_g op not available in this build"
+            if c.zero_points and not hasattr(torch.ops._rocm_C, "wvSplitK_int4_g_zp"):
+                return False, "wvSplitK_int4_g_zp op not available in this build"
         except Exception:
             return False, "ROCm ops not available"
 
@@ -378,9 +412,6 @@ class HybridW4A16LinearKernel(MPLinearKernel):
 
         if c.act_type not in (torch.float16, torch.bfloat16):
             return False, "requires float16 or bfloat16 activations"
-
-        if c.zero_points:
-            return False, "does not support zero points (asymmetric)"
 
         if c.has_g_idx:
             return False, "does not support g_idx reordering"
@@ -410,10 +441,14 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         w_q_raw = getattr(layer, self.w_q_name)
         w_s_raw = getattr(layer, self.w_s_name)
 
-        # Unpack raw weights to [N, K] int32
+        # Unpack raw weights and normalize to [N, K] int32
         unpacked = unpack_quantized_values_into_int32(
             w_q_raw.data, c.weight_type, packed_dim=w_q_raw.packed_dim
         )
+        # AWQ-converted weights arrive as (K, N) with output_dim=1;
+        # compressed-tensors arrive as (N, K) with output_dim=0.
+        if getattr(w_q_raw, "output_dim", 0) != 0:
+            unpacked = unpacked.t().contiguous()
 
         # ---- Pack into skinny format: [N, K//8] ExLlama shuffle ----
         shuffled = pack_int4_exllama_shuffle(unpacked)
@@ -422,8 +457,26 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         w_q_skinny_i32 = shuffled.contiguous()
         w_q_skinny = w_q_skinny_i32.view(torch.int8)
 
-        # ---- Prepare skinny scales: [N, K//G] ----
+        # ---- Prepare skinny scales: normalize to [N, K//G] ----
+        permute_param_layout_(w_s_raw, input_dim=1, output_dim=0)
         w_s_skinny = w_s_raw.data.contiguous()
+
+        # ---- Process zero-points for asymmetric quantization ----
+        if c.zero_points:
+            assert self.w_zp_name is not None
+            w_zp_raw = getattr(layer, self.w_zp_name)
+            # Normalize zp layout to (N, num_groups)
+            permute_param_layout_(w_zp_raw, input_dim=1, output_dim=0, packed_dim=0)
+            zp_unpacked = unpack_quantized_values_into_int32(
+                w_zp_raw.data, c.weight_type, packed_dim=0
+            )
+            # zp_unpacked: [N, num_groups] with raw uint4 values [0..15]
+            # Store adjusted zero-points (zp_raw - 8) in activation dtype.
+            # Both kernels use this format:
+            #   HIP skinny: expects (zp - 8) because it computes (nibble - 8)
+            #   Triton: computes (b - 8) then subtracts zp_adj
+            w_zp = (zp_unpacked - 8).to(c.act_type).contiguous()
+            self._transform_param(layer, self.w_zp_name, lambda x: w_zp)
 
         # ---- Store on layer ----
         # Replace w_q with skinny int8 (primary weights for skinny kernel)
@@ -446,14 +499,12 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         from vllm.utils.platform_utils import num_compute_units
 
         c = self.config
-        w_q, w_s, _, _ = self._get_weight_params(layer)
+        w_q, w_s, w_zp, _ = self._get_weight_params(layer)
         w_q_i32 = layer._hybrid_w_q_i32
 
         x_2d = x.reshape(-1, x.shape[-1])
         N = w_q.shape[0]
         out_shape = x.shape[:-1] + (N,)
-
-        zp_bias = c.weight_type.bias if c.weight_type.has_bias() else 0
 
         cu_count = num_compute_units()
         output = torch.ops.vllm.hybrid_w4a16_apply(
@@ -461,9 +512,9 @@ class HybridW4A16LinearKernel(MPLinearKernel):
             w_q,
             w_s,
             w_q_i32,
+            w_zp,
             bias,
             cu_count,
             c.group_size,
-            zp_bias,
         )
         return output.reshape(out_shape)
