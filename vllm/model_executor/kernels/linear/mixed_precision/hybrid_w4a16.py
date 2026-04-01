@@ -397,8 +397,6 @@ class HybridW4A16LinearKernel(MPLinearKernel):
                 torch.ops._rocm_C, "wvSplitK_int4_g"
             ):
                 return False, "wvSplitK_int4_g op not available in this build"
-            if c.zero_points and not hasattr(torch.ops._rocm_C, "wvSplitK_int4_g_zp"):
-                return False, "wvSplitK_int4_g_zp op not available in this build"
         except Exception:
             return False, "ROCm ops not available"
 
