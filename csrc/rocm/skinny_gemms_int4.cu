@@ -978,12 +978,18 @@ torch::Tensor wvSplitK_int4_g(const at::Tensor& in_a, const at::Tensor& in_b,
   TORCH_CHECK(K_in % group_size == 0,
               "K must be divisible by group_size=", group_size);
   int64_t num_groups = K_in / group_size;
+  TORCH_CHECK(in_scale.dim() == 2,
+              "Scale must be 2D [M, K/group_size], got shape ",
+              in_scale.sizes());
   TORCH_CHECK(in_scale.size(0) == M_in && in_scale.size(1) == num_groups,
               "Scale must be [M, K/group_size] = [", M_in, ", ", num_groups,
               "] but got [", in_scale.size(0), ", ", in_scale.size(1), "]");
   if (in_zero_points.has_value()) {
     TORCH_CHECK(in_zero_points->dtype() == in_b.dtype(),
                 "Zero points dtype must match activation dtype");
+    TORCH_CHECK(in_zero_points->dim() == 2,
+                "Zero points must be 2D [M, K/group_size], got shape ",
+                in_zero_points->sizes());
     TORCH_CHECK(in_zero_points->size(0) == M_in &&
                     in_zero_points->size(1) == num_groups,
                 "Zero points must be [M, K/group_size] = [", M_in, ", ",
