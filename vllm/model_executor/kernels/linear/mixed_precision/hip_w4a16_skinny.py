@@ -41,12 +41,8 @@ def _w4a16_apply_impl(
     K = x_2d.shape[1]
 
     if N <= SKINNY_GEMM_MAX_N and K * N <= LDS_CAPACITY_ELEMENTS:
-        if w_zp is not None and group_size > 0:
-            return ops.wvSplitK_int4_g_zp(
-                w_q, x_2d, w_s, w_zp, cu_count, group_size, bias
-            )
-        elif group_size > 0:
-            return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, bias)
+        if group_size > 0:
+            return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, w_zp, bias)
         else:
             return ops.wvSplitK_int4(w_q, x_2d, w_s, cu_count, bias)
 
@@ -91,7 +87,7 @@ class HipW4A16SkinnyLinearKernel(MPLinearKernel):
 
     Supports both per-channel (group_size=-1) and per-group (group_size=32/128)
     quantization, including symmetric (uint4b8) and asymmetric (uint4 with zero
-    points). Uses wvSplitK_int4/wvSplitK_int4_g/wvSplitK_int4_g_zp for small
+    points). Uses wvSplitK_int4/wvSplitK_int4_g for small
     batch sizes where activations fit in LDS, with dequant+linear fallback for
     larger batches. Wrapped as a custom op to avoid torch.compile issues with
     the data-dependent N<=4 branch.

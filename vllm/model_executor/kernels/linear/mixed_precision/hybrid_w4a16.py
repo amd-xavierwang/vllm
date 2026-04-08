@@ -289,7 +289,7 @@ def _hybrid_w4a16_apply_impl(
     # Use the HIP skinny kernel for small batch sizes (fast decode path),
     # but only when K*M fits in LDS.  Otherwise fall through to Triton.
     if M <= MAX_SKINNY_BATCH_SIZE and K * M <= LDS_CAPACITY_ELEMENTS:
-        return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, bias)
+        return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, None, bias)
 
     output = triton_w4a16_skinny_fmt_gemm(
         a=x_2d,
