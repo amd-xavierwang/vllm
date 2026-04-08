@@ -285,21 +285,34 @@ def _hybrid_w4a16_apply_impl(
 
     M = x_2d.shape[0]
     K = x_2d.shape[1]
+    N = w_q.shape[0]
 
     # Use the HIP skinny kernel for small batch sizes (fast decode path),
     # but only when K*M fits in LDS.  Otherwise fall through to Triton.
     if M <= MAX_SKINNY_BATCH_SIZE and K * M <= LDS_CAPACITY_ELEMENTS:
-        return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, None, bias)
+        ctx = (
+            nullcontext()
+            if torch.compiler.is_compiling()
+            else torch.profiler.record_function(f"wvsplitk_int4 {M}x{N}x{K}")
+        )
+        with ctx:
+            return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, None, bias)
 
-    output = triton_w4a16_skinny_fmt_gemm(
-        a=x_2d,
-        b_q=w_q_i32,
-        scales=w_s,
-        group_size=group_size,
-        zp_bias=zp_bias,
+    ctx = (
+        nullcontext()
+        if torch.compiler.is_compiling()
+        else torch.profiler.record_function(f"hybrid_triton_w4a16 {M}x{N}x{K}")
     )
-    if bias is not None:
-        output.add_(bias)
+    with ctx:
+        output = triton_w4a16_skinny_fmt_gemm(
+            a=x_2d,
+            b_q=w_q_i32,
+            scales=w_s,
+            group_size=group_size,
+            zp_bias=zp_bias,
+        )
+        if bias is not None:
+            output.add_(bias)
     return output
 
 
@@ -437,28 +450,20 @@ class HybridW4A16LinearKernel(MPLinearKernel):
         w_q_i32 = layer._hybrid_w_q_i32
 
         x_2d = x.reshape(-1, x.shape[-1])
-        M = x_2d.shape[0]
-        K = x_2d.shape[1]
         N = w_q.shape[0]
         out_shape = x.shape[:-1] + (N,)
 
         zp_bias = c.weight_type.bias if c.weight_type.has_bias() else 0
 
-        ctx = (
-            nullcontext()
-            if torch.compiler.is_compiling()
-            else torch.profiler.record_function(f"hybrid_w4a16 {M}x{N}x{K}")
+        cu_count = num_compute_units()
+        output = torch.ops.vllm.hybrid_w4a16_apply(
+            x_2d,
+            w_q,
+            w_s,
+            w_q_i32,
+            bias,
+            cu_count,
+            c.group_size,
+            zp_bias,
         )
-        with ctx:
-            cu_count = num_compute_units()
-            output = torch.ops.vllm.hybrid_w4a16_apply(
-                x_2d,
-                w_q,
-                w_s,
-                w_q_i32,
-                bias,
-                cu_count,
-                c.group_size,
-                zp_bias,
-            )
         return output.reshape(out_shape)
