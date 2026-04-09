@@ -12,7 +12,7 @@ on:
     inputs:
       pytorch_index:
         description: 'PyTorch index URL for ROCm nightly wheels'
-        default: 'https://rocm.nightlies.amd.com/v2-staging/gfx1151'
+        default: 'https://rocm.nightlies.amd.com/v2/gfx1151'
         required: false
       rocm_arch:
         description: 'ROCm architecture (e.g., gfx1151, gfx1150;gfx1151)'
@@ -20,7 +20,7 @@ on:
         required: false
 
 env:
-  PYTORCH_INDEX_URL: ${{ github.event.inputs.pytorch_index || 'https://rocm.nightlies.amd.com/v2-staging/gfx1151' }}
+  PYTORCH_INDEX_URL: ${{ github.event.inputs.pytorch_index || 'https://rocm.nightlies.amd.com/v2/gfx1151' }}
   PYTORCH_ROCM_ARCH: ${{ github.event.inputs.rocm_arch || 'gfx1150;gfx1151;gfx1152;gfx1153' }}
 
 jobs:
@@ -243,7 +243,7 @@ jobs:
             
             ### Installation
             ```bash
-            pip install torch --extra-index-url https://rocm.nightlies.amd.com/v2-staging/gfx1151
+            pip install torch --extra-index-url https://rocm.nightlies.amd.com/v2/gfx1151
             pip install vllm --extra-index-url https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/wheels
             ```
 
@@ -355,7 +355,7 @@ jobs:
               <p>Pre-built wheels for AMD ROCm (gfx11 / Strix Halo / RDNA3+)</p>
               <p><em>Generated: {datetime.now().isoformat()}</em></p>
               <h2>Installation</h2>
-              <pre>pip install torch --extra-index-url https://rocm.nightlies.amd.com/v2-staging/gfx1151
+              <pre>pip install torch --extra-index-url https://rocm.nightlies.amd.com/v2/gfx1151
           pip install vllm --extra-index-url {BASE_URL}</pre>
               <h2>Available Packages</h2>
           """
