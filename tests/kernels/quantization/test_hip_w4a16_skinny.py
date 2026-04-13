@@ -237,7 +237,6 @@ def test_skinny_asymmetric_correctness(
         (32, 2048, 32 * 16),
         (128, 256, 128 * 2),
         (128, 2048, 128 * 7),
-        (-1, 256, 16 * 4),
     ],
 )
 @pytest.mark.parametrize("act_dtype", [torch.float16])

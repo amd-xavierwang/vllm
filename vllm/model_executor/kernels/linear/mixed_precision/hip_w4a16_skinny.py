@@ -41,10 +41,7 @@ def _w4a16_apply_impl(
     K = x_2d.shape[1]
 
     if N <= SKINNY_GEMM_MAX_N and K * N <= LDS_CAPACITY_ELEMENTS:
-        if group_size > 0:
-            return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, w_zp, bias)
-        else:
-            return ops.wvSplitK_int4(w_q, x_2d, w_s, cu_count, bias)
+        return ops.wvSplitK_int4_g(w_q, x_2d, w_s, cu_count, group_size, w_zp, bias)
 
     assert w_dequant is not None, (
         "w_dequant must be pre-computed for large-batch fallback"
@@ -85,12 +82,11 @@ _W4A16_LIB = _register_w4a16_op()
 class HipW4A16SkinnyLinearKernel(MPLinearKernel):
     """W4A16 skinny GEMM for ROCm (gfx11) using packed int4 weights.
 
-    Supports both per-channel (group_size=-1) and per-group (group_size=32/128)
-    quantization, including symmetric (uint4b8) and asymmetric (uint4 with zero
-    points). Uses wvSplitK_int4/wvSplitK_int4_g for small
-    batch sizes where activations fit in LDS, with dequant+linear fallback for
-    larger batches. Wrapped as a custom op to avoid torch.compile issues with
-    the data-dependent N<=4 branch.
+    Supports per-group (group_size=32/128) quantization, including symmetric
+    (uint4b8) and asymmetric (uint4 with zero points). Uses wvSplitK_int4_g
+    for small batch sizes where activations fit in LDS, with dequant+linear
+    fallback for larger batches. Wrapped as a custom op to avoid torch.compile
+    issues with the data-dependent N<=4 branch.
     """
 
     @classmethod
@@ -101,9 +97,9 @@ class HipW4A16SkinnyLinearKernel(MPLinearKernel):
     def can_implement(cls, c: MPLinearLayerConfig) -> tuple[bool, str | None]:
         try:
             if not hasattr(torch.ops, "_rocm_C") or not hasattr(
-                torch.ops._rocm_C, "wvSplitK_int4"
+                torch.ops._rocm_C, "wvSplitK_int4_g"
             ):
-                return False, "wvSplitK_int4 op not available in this build"
+                return False, "wvSplitK_int4_g op not available in this build"
         except Exception:
             return False, "ROCm ops not available"
 
@@ -113,11 +109,8 @@ class HipW4A16SkinnyLinearKernel(MPLinearKernel):
         if c.act_type not in (torch.float16, torch.bfloat16):
             return False, "requires float16 or bfloat16 activations"
 
-        if c.group_size not in (-1, 32, 128):
-            return False, f"group_size must be -1, 32, or 128 (got {c.group_size})"
-
-        if c.zero_points and c.group_size == -1:
-            return False, "zero points require per-group quantization"
+        if c.group_size not in (32, 128):
+            return False, f"group_size must be 32 or 128 (got {c.group_size})"
 
         if c.has_g_idx:
             return False, "does not support g_idx reordering"
@@ -152,14 +145,11 @@ class HipW4A16SkinnyLinearKernel(MPLinearKernel):
         if getattr(w_q_raw, "output_dim", 0) != 0:
             unpacked = unpacked.t().contiguous()
 
-        # Normalize scales to (M, num_groups) or (M, 1).
+        # Normalize scales to (M, num_groups).
         w_s_raw_data = w_s_raw.data
         if getattr(w_s_raw, "output_dim", 0) != 0:
             w_s_raw_data = w_s_raw_data.t().contiguous()
-        w_s_clean = w_s_raw_data
-        if c.group_size == -1:
-            w_s_clean = w_s_clean.squeeze(-1)
-        w_s_clean = w_s_clean.contiguous()
+        w_s_clean = w_s_raw_data.contiguous()
 
         # Process zero points for asymmetric quantization
         self._w_zp = None
@@ -187,12 +177,9 @@ class HipW4A16SkinnyLinearKernel(MPLinearKernel):
             bias_val = c.weight_type.bias
             w_fp = (unpacked - bias_val).to(c.act_type)
 
-            if c.group_size > 0:
-                num_groups = K // c.group_size
-                w_fp = w_fp.view(M, num_groups, c.group_size)
-                w_fp = (w_fp * w_s_clean.unsqueeze(-1)).view(M, K)
-            else:
-                w_fp = w_fp * w_s_clean.unsqueeze(1)
+            num_groups = K // c.group_size
+            w_fp = w_fp.view(M, num_groups, c.group_size)
+            w_fp = (w_fp * w_s_clean.unsqueeze(-1)).view(M, K)
 
         self._w_dequant = w_fp.contiguous()
 
@@ -228,8 +215,6 @@ class HipW4A16SkinnyLinearKernel(MPLinearKernel):
             # Normalize to (M, num_groups)
             if getattr(x, "output_dim", 0) != 0:
                 data = data.t().contiguous()
-            if c.group_size == -1:
-                return data.squeeze(-1).contiguous()
             return data.contiguous()
 
         self._transform_param(layer, self.w_q_name, transform_w_q)
