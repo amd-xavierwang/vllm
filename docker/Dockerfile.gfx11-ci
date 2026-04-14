@@ -13,7 +13,7 @@ FROM python:3.12-bookworm
 
 ARG ROCM_NIGHTLY_INDEX=https://rocm.nightlies.amd.com/v2/gfx1151
 ARG PYTORCH_VERSION=2.10.0
-ARG SCCACHE_VERSION=v0.8.1
+ARG SCCACHE_VERSION=v0.14.0
 
 # System build tools
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \

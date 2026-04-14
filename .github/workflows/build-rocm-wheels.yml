@@ -21,146 +21,74 @@ on:
 env:
   PYTORCH_INDEX_URL: ${{ github.event.inputs.pytorch_index || 'https://rocm.nightlies.amd.com/v2/gfx1151' }}
   PYTORCH_ROCM_ARCH: ${{ github.event.inputs.rocm_arch || 'gfx1150;gfx1151' }}
+  CI_IMAGE: ghcr.io/rocm/vllm/gfx11-ci:latest
 
 jobs:
   build-wheel:
     runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/rocm/vllm/gfx11-ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     permissions:
       contents: read
+      packages: read
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Full history for setuptools-scm versioning
+          fetch-depth: 0
           fetch-tags: true
 
       - name: Fetch upstream tags for versioning
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git remote add upstream https://github.com/vllm-project/vllm.git || true
           git fetch upstream --tags || echo "Warning: could not fetch upstream tags"
           git describe --tags --always || echo "Warning: git describe failed"
 
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: false      # Keep tool cache for Python setup
-          android: true          # ~12GB
-          dotnet: true           # ~6GB
-          haskell: true          # ~5GB
-          large-packages: true   # ~5GB
-          docker-images: true    # ~3GB
-          swap-storage: true     # ~4GB
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Cache pip packages
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: pip-rocm-${{ runner.os }}-${{ hashFiles('requirements/*.txt') }}
-          restore-keys: |
-            pip-rocm-${{ runner.os }}-
-
-      - name: Install and configure sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
       - name: Install build dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install build wheel setuptools setuptools-scm ninja cmake packaging jinja2
+          uv pip install --system -r requirements/rocm-build.txt \
+            --extra-index-url ${{ env.PYTORCH_INDEX_URL }} \
+            --index-strategy unsafe-first-match
+          uv pip install --system -r requirements/build.txt \
+            --extra-index-url ${{ env.PYTORCH_INDEX_URL }} \
+            --index-strategy unsafe-first-match
 
-      - name: Install PyTorch, ROCm SDK and build deps
-        run: |
-          # Install from rocm-build.txt (pins torch==2.10.0 etc.)
-          # Use nightly index instead of the default ROCm test index in the file
-          pip install -r requirements/rocm-build.txt \
-            --extra-index-url ${{ env.PYTORCH_INDEX_URL }}
-          
-          # Install ROCm SDK with devel and libraries extras
-          pip install "rocm[devel,libraries]" --extra-index-url ${{ env.PYTORCH_INDEX_URL }} || \
-            echo "Warning: Could not install rocm[devel,libraries]"
-          
-          # Initialize ROCm SDK (creates symlinks, etc.)
-          rocm-sdk init || echo "Warning: rocm-sdk init failed"
-          
-          # Use amdsmi bundled in rocm-sdk-core (not the PyPI package)
-          SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
-          export PYTHONPATH="$SITE_PACKAGES/_rocm_sdk_core/share/amd_smi${PYTHONPATH:+:$PYTHONPATH}"
-          
-          # Show what's installed
-          pip list | grep -i -E "rocm|torch|sdk" || true
-          python -c "import torch; print(f'PyTorch version: {torch.__version__}'); print(f'HIP: {torch.version.hip}'); print(f'CUDA: {torch.version.cuda}')"
+      - name: Expose GitHub Actions cache env vars
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env['ACTIONS_RESULTS_URL'])
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env['ACTIONS_RUNTIME_TOKEN'])
 
-      - name: Configure ROCm environment
-        id: rocm-env
+      # TODO: Remove this step once the gfx11-ci image is rebuilt with sccache v0.14.0
+      - name: Upgrade sccache
         run: |
-          # Get site-packages path
-          SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
-          echo "SITE_PACKAGES=$SITE_PACKAGES"
-          
-          # List what ROCm packages are installed
-          echo "=== ROCm packages in site-packages ==="
-          find "$SITE_PACKAGES" -maxdepth 1 -iname '*rocm*' -ls || true
-          ls -la "$SITE_PACKAGES"/_rocm* 2>/dev/null || true
-          
-          # Set ROCm paths based on AMD nightly wheel structure
-          ROCM_PATH="$SITE_PACKAGES/_rocm_sdk_devel"
-          HIP_DEVICE_LIB_PATH="$SITE_PACKAGES/_rocm_sdk_core/lib/llvm/amdgcn/bitcode"
-          ROCM_BIN="$ROCM_PATH/bin"
-          
-          echo "=== ROCM_PATH contents ==="
-          ls -la "$ROCM_PATH" 2>/dev/null || echo "Warning: ROCM_PATH not found"
-          ls -la "$ROCM_PATH/bin" 2>/dev/null || echo "Warning: ROCM_PATH/bin not found"
-          ls -la "$ROCM_PATH/lib/llvm/bin" 2>/dev/null || echo "Warning: ROCM_PATH/lib/llvm/bin not found"
-          
-          echo "=== HIP_DEVICE_LIB_PATH contents ==="
-          find "$HIP_DEVICE_LIB_PATH" -maxdepth 1 -ls 2>/dev/null | head -20 || echo "Warning: HIP_DEVICE_LIB_PATH not found"
-          
-          # Use amdsmi bundled in rocm-sdk-core (not the PyPI package)
-          AMDSMI_PATH="$SITE_PACKAGES/_rocm_sdk_core/share/amd_smi"
-          
-          # Export to GITHUB_ENV for subsequent steps
-          {
-            echo "ROCM_PATH=$ROCM_PATH"
-            echo "HIP_DEVICE_LIB_PATH=$HIP_DEVICE_LIB_PATH"
-            echo "PATH=$ROCM_BIN:$PATH"
-            echo "PYTHONPATH=$AMDSMI_PATH${PYTHONPATH:+:$PYTHONPATH}"
-          } >> "$GITHUB_ENV"
-          
-          # Verify hipcc is available
-          echo "=== Checking hipcc ==="
-          which hipcc || echo "hipcc not found in PATH"
-          head -50 "$(which hipcc)" 2>/dev/null || true
-
-      - name: Install remaining vLLM build requirements
-        run: |
-          # build.txt has additional deps not in rocm-build.txt (e.g. grpcio-tools)
-          pip install -r requirements/build.txt --extra-index-url ${{ env.PYTORCH_INDEX_URL }}
+          curl -L "https://github.com/mozilla/sccache/releases/download/v0.14.0/sccache-v0.14.0-x86_64-unknown-linux-musl.tar.gz" \
+            | tar xz --strip-components=1 -C /usr/local/bin --wildcards '*/sccache'
+          sccache --version
 
       - name: Build wheel
         env:
           PYTORCH_ROCM_ARCH: ${{ env.PYTORCH_ROCM_ARCH }}
           VLLM_TARGET_DEVICE: rocm
           MAX_JOBS: 2
-          # sccache is auto-detected by setup.py and passed to CMake
           SCCACHE_GHA_ENABLED: "true"
           SCCACHE_IDLE_TIMEOUT: 0
         run: |
           echo "=== Environment ==="
           echo "ROCM_PATH=$ROCM_PATH"
           echo "PYTORCH_ROCM_ARCH=$PYTORCH_ROCM_ARCH"
-          echo "VLLM_TARGET_DEVICE=$VLLM_TARGET_DEVICE"
-          echo "sccache stats before build:"
+          hipcc --version
           sccache --show-stats || true
           echo ""
           echo "=== Building wheel ==="
           python setup.py bdist_wheel --dist-dir=dist
           echo ""
-          echo "sccache stats after build:"
           sccache --show-stats || true
           ls -la dist/
 
@@ -186,8 +114,19 @@ jobs:
   test-kernels:
     runs-on: linux-strix-halo-gpu-rocm-oem
     needs: build-wheel
+    container:
+      image: ghcr.io/rocm/vllm/gfx11-ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: >-
+        --device /dev/kfd
+        --device /dev/dri
+        --group-add video
+        --security-opt seccomp=unconfined
     permissions:
       contents: read
+      packages: read
 
     env:
       PYTORCH_INDEX_URL: ${{ github.event.inputs.pytorch_index || 'https://rocm.nightlies.amd.com/v2/gfx1151' }}
@@ -195,19 +134,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq gcc g++
-
-      - name: Install uv
-        run: curl -LsSf https://astral.sh/uv/install.sh | sh
 
       - name: Download wheel artifact
         uses: actions/download-artifact@v4
@@ -217,39 +143,28 @@ jobs:
 
       - name: Install wheel and test dependencies
         run: |
-          uv venv .venv
-          source .venv/bin/activate
-          # Install ROCm torch first from the nightly index exclusively,
-          # so uv does not pick the CUDA torch from PyPI.
-          uv pip install torch==2.10.0 \
-            --index-url ${{ env.PYTORCH_INDEX_URL }}
-          uv pip install dist/*.whl \
+          # PyTorch is pre-installed in the container image; install remaining deps.
+          uv pip install --system dist/*.whl \
             pytest pytest-timeout numpy \
             tblib transformers huggingface_hub sentencepiece pillow \
             --extra-index-url ${{ env.PYTORCH_INDEX_URL }} \
             --index-strategy unsafe-first-match
           # Nightly torchvision has operator ABI mismatch with nightly torch.
           # Our kernel tests don't need it; remove to prevent conftest crash.
-          uv pip uninstall torchvision 2>/dev/null || true
+          uv pip uninstall --system torchvision 2>/dev/null || true
 
       - name: Prepare test environment
         run: |
-          source .venv/bin/activate
           # Remove the source vllm/ directory so Python imports from the
           # installed wheel (which has compiled C extensions) instead of
           # the checkout source tree (which has no .so files).
           mv vllm vllm_src
 
-          # amdsmi (used for ROCm platform detection) is bundled inside
-          # _rocm_sdk_core, not installed as a regular package.
-          SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
-          echo "PYTHONPATH=$SITE_PACKAGES/_rocm_sdk_core/share/amd_smi${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
-
           # Verify torch, vllm._C, and ROCm platform detection work.
-          PYTHONPATH="$SITE_PACKAGES/_rocm_sdk_core/share/amd_smi${PYTHONPATH:+:$PYTHONPATH}" \
           python -c "
           import torch
           print(f'PyTorch {torch.__version__}, HIP: {torch.version.hip}')
+          print(f'GPU: {torch.cuda.get_device_name(0)}')
           import vllm._C
           print('vllm._C loaded successfully')
           from vllm.platforms import current_platform
@@ -258,7 +173,6 @@ jobs:
 
       - name: Run kernel tests
         run: |
-          source .venv/bin/activate
           python -m pytest -v --timeout=300 \
             tests/kernels/moe/test_exllama_moe.py \
             tests/kernels/quantization/test_awq_gemv_moe.py \
@@ -305,4 +219,3 @@ jobs:
               s3.upload_file(whl, bucket, key)
               print(f"  Done")
           PYEOF
-
