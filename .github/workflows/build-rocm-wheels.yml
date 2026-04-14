@@ -58,11 +58,20 @@ jobs:
             --extra-index-url ${{ env.PYTORCH_INDEX_URL }} \
             --index-strategy unsafe-first-match
 
+      - name: Expose GitHub Actions cache env vars
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env['ACTIONS_CACHE_URL'])
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env['ACTIONS_RESULTS_URL'])
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env['ACTIONS_RUNTIME_TOKEN'])
+
       - name: Build wheel
         env:
           PYTORCH_ROCM_ARCH: ${{ env.PYTORCH_ROCM_ARCH }}
           VLLM_TARGET_DEVICE: rocm
           MAX_JOBS: 2
+          SCCACHE_GHA_ENABLED: "true"
           SCCACHE_IDLE_TIMEOUT: 0
         run: |
           echo "=== Environment ==="
