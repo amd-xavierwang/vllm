@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import enum
+from contextlib import nullcontext
 from enum import Enum
 from fractions import Fraction
 from typing import TYPE_CHECKING, Any, Union
@@ -376,18 +377,27 @@ class GPTQLinearMethod(LinearMethodBase):
         out_shape = x.shape[:-1] + (layer.qweight.shape[-1],)
         reshaped_x = x.reshape(-1, x.shape[-1])
 
+        M = reshaped_x.shape[0]
+        N = layer.qweight.shape[-1]
+        K = reshaped_x.shape[1]
+        ctx = (
+            nullcontext()
+            if torch.compiler.is_compiling()
+            else torch.profiler.record_function(f"exllama_gptq_gemm {M}x{N}x{K}")
+        )
         # GPTQ v1 and v2 format checkpoints deals with zero points differently,
         # and require different gemm kernels.
-        output = ops.gptq_gemm(
-            reshaped_x,
-            layer.qweight,
-            layer.qzeros,
-            layer.scales,
-            layer.g_idx,
-            layer.exllama_state == ExllamaState.READY,
-            self.use_v2_format,
-            self.quant_config.weight_bits,
-        )
+        with ctx:
+            output = ops.gptq_gemm(
+                reshaped_x,
+                layer.qweight,
+                layer.qzeros,
+                layer.scales,
+                layer.g_idx,
+                layer.exllama_state == ExllamaState.READY,
+                self.use_v2_format,
+                self.quant_config.weight_bits,
+            )
         if bias is not None:
             output.add_(bias)
         return output.reshape(out_shape)
