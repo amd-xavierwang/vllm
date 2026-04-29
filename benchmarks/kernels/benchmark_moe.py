@@ -337,6 +337,7 @@ def benchmark_config(
 
 
 def get_rocm_tuning_space(use_fp16):
+    from vllm.platforms.rocm import on_gfx9
     block_mn_range = [16, 32, 64, 128, 256]
     block_k_range = [16, 32, 64, 128, 256]
     if not use_fp16:
@@ -345,8 +346,6 @@ def get_rocm_tuning_space(use_fp16):
     group_m_range = [1, 4, 8, 16, 32]
     num_stage_range = [2]
     waves_per_eu_range = [0, 1, 2, 4]
-    matrix_instr_nonkdim_range = [16, 32] if use_fp16 else []
-    kpack_range = [1, 2] if use_fp16 else []
 
     param_ranges = {
         "BLOCK_SIZE_M": block_mn_range,
@@ -357,9 +356,10 @@ def get_rocm_tuning_space(use_fp16):
         "num_stages": num_stage_range,
         "waves_per_eu": waves_per_eu_range,
     }
-    if use_fp16:
-        param_ranges["matrix_instr_nonkdim"] = matrix_instr_nonkdim_range
-        param_ranges["kpack"] = kpack_range
+    # RDNA doesn't use matrix_instr_nonkdim nor kpack
+    if use_fp16 and on_gfx9():
+        param_ranges["matrix_instr_nonkdim"] = [16, 32]
+        param_ranges["kpack"] = [1, 2]
 
     return param_ranges
 
