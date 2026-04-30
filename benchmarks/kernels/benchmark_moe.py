@@ -71,9 +71,9 @@ def clear_triton_cache():
         ):
             triton.runtime.cache.clear()
         else:
-            # On Triton 3.6+, triton.runtime.cache is a module without .clear(),
-            # The real compiled-kernel cache lives
-            # on each JITFunction.device_caches defaultdict.
+            # On Triton 3.6+ triton.runtime.cache is a module without
+            # .clear(). The real compiled-kernel cache lives on each
+            # JITFunction.device_caches defaultdict.
             for obj in gc.get_objects():
                 if isinstance(obj, triton.JITFunction):
                     obj.device_caches.clear()
@@ -673,6 +673,7 @@ class BenchmarkWorker:
                         use_deep_gemm=use_deep_gemm,
                     )
                 except (triton.runtime.autotuner.OutOfResources, RuntimeError):
+                    # Some configurations may be invalid and fail to compile.
                     continue
 
                 if kernel_time < best_time:
