@@ -46,6 +46,9 @@ FP8_DTYPE = current_platform.fp8_dtype()
 _CACHE_CLEAR_INTERVAL_ENV = "VLLM_MOE_TUNE_CACHE_CLEAR_INTERVAL"
 TRITON_CACHE_CLEAR_INTERVAL = int(os.environ.get(_CACHE_CLEAR_INTERVAL_ENV, "50"))
 
+# RDNA doesn't have MFMA but WMMA
+WMMA_TILE = 16
+
 
 def clear_triton_cache():
     """Clear Triton JIT compilation cache and Python/CUDA memory.
@@ -67,6 +70,13 @@ def clear_triton_cache():
             and hasattr(triton.runtime.cache, "clear")
         ):
             triton.runtime.cache.clear()
+        else:
+            # On Triton 3.6+, triton.runtime.cache is a module without .clear(),
+            # The real compiled-kernel cache lives
+            # on each JITFunction.device_caches defaultdict.
+            for obj in gc.get_objects():
+                if isinstance(obj, triton.JITFunction):
+                    obj.device_caches.clear()
     except ImportError:
         # Triton not installed, skip cache clearing
         pass
@@ -75,16 +85,6 @@ def clear_triton_cache():
         pass
     except Exception as e:
         print(f"Warning: Failed to clear Triton cache: {e}")
-
-    # On Triton 3.6+, triton.runtime.cache is a module without .clear(),
-    # so the above path is a no-op. The real compiled-kernel cache lives
-    # on each JITFunction.device_caches defaultdict.
-    try:
-        for obj in gc.get_objects():
-            if isinstance(obj, triton.JITFunction):
-                obj.device_caches.clear()
-    except Exception as e:
-        print(f"Warning: Failed to clear Triton JITFunction caches: {e}")
 
     # Additional garbage collection after clearing caches
     gc.collect()
@@ -456,7 +456,7 @@ def prune_rocm_configs(M, N, K, configs, is_fp16=True):
         num_warps = config.get("num_warps")
 
         if is_fp16:
-            matrix_instr_nonkdim = config.get("matrix_instr_nonkdim", 16)
+            matrix_instr_nonkdim = config.get("matrix_instr_nonkdim", WMMA_TILE)
             if matrix_instr_nonkdim > mfma:
                 continue
         if mfma == 4 and BLOCK_SIZE_K < 64:
@@ -515,10 +515,9 @@ def prune_rocm_configs(M, N, K, configs, is_fp16=True):
         # RDNA (gfx11/gfx12): reject configs that exceed 256 VGPRs per wave.
         # WMMA is 16x16, and 8 VGPRs are needed for fp32 accumulator
         if not on_gfx9():
-            wmma_tile = 16
             accum_vgprs = (
-                (BLOCK_SIZE_M // wmma_tile)
-                * (BLOCK_SIZE_N // wmma_tile)
+                (BLOCK_SIZE_M // WMMA_TILE)
+                * (BLOCK_SIZE_N // WMMA_TILE)
                 // num_warps
                 * 8
             )
