@@ -36,6 +36,9 @@ from vllm.triton_utils import triton
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.torch_utils import set_random_seed
 
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx9
+
 FP8_DTYPE = current_platform.fp8_dtype()
 
 # Default interval for clearing Triton JIT cache during tuning
@@ -72,6 +75,16 @@ def clear_triton_cache():
         pass
     except Exception as e:
         print(f"Warning: Failed to clear Triton cache: {e}")
+
+    # On Triton 3.6+, triton.runtime.cache is a module without .clear(),
+    # so the above path is a no-op. The real compiled-kernel cache lives
+    # on each JITFunction.device_caches defaultdict.
+    try:
+        for obj in gc.get_objects():
+            if isinstance(obj, triton.JITFunction):
+                obj.device_caches.clear()
+    except Exception as e:
+        print(f"Warning: Failed to clear Triton JITFunction caches: {e}")
 
     # Additional garbage collection after clearing caches
     gc.collect()
@@ -337,7 +350,6 @@ def benchmark_config(
 
 
 def get_rocm_tuning_space(use_fp16):
-    from vllm.platforms.rocm import on_gfx9
     block_mn_range = [16, 32, 64, 128, 256]
     block_k_range = [16, 32, 64, 128, 256]
     if not use_fp16:
@@ -444,7 +456,7 @@ def prune_rocm_configs(M, N, K, configs, is_fp16=True):
         num_warps = config.get("num_warps")
 
         if is_fp16:
-            matrix_instr_nonkdim = config.get("matrix_instr_nonkdim")
+            matrix_instr_nonkdim = config.get("matrix_instr_nonkdim", 16)
             if matrix_instr_nonkdim > mfma:
                 continue
         if mfma == 4 and BLOCK_SIZE_K < 64:
@@ -498,6 +510,20 @@ def prune_rocm_configs(M, N, K, configs, is_fp16=True):
             if BLOCK_SIZE_K < 64:
                 continue
             if num_warps < 4:
+                continue
+
+        # RDNA (gfx11/gfx12): reject configs that exceed 256 VGPRs per wave.
+        # WMMA is 16x16, and 8 VGPRs are needed for fp32 accumulator
+        if not on_gfx9():
+            wmma_tile = 16
+            accum_vgprs = (
+                (BLOCK_SIZE_M // wmma_tile)
+                * (BLOCK_SIZE_N // wmma_tile)
+                // num_warps
+                * 8
+            )
+            # Reject edge case to leave room for inputs and weights
+            if accum_vgprs >= 256:
                 continue
 
         pruned_configs.append(config)
@@ -647,8 +673,7 @@ class BenchmarkWorker:
                         block_quant_shape=block_quant_shape,
                         use_deep_gemm=use_deep_gemm,
                     )
-                except triton.runtime.autotuner.OutOfResources:
-                    # Some configurations may be invalid and fail to compile.
+                except (triton.runtime.autotuner.OutOfResources, RuntimeError):
                     continue
 
                 if kernel_time < best_time:
