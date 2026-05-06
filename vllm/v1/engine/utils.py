@@ -113,6 +113,7 @@ class CoreEngineProcManager:
         log_stats: bool,
         client_handshake_address: str | None = None,
         tensor_queue: Queue | None = None,
+        shutdown_timeout: float = 5.0,
     ):
         context = get_mp_context()
         common_kwargs = {
@@ -148,7 +149,7 @@ class CoreEngineProcManager:
                 )
             )
 
-        self._finalizer = weakref.finalize(self, shutdown, self.processes)
+        self._finalizer = weakref.finalize(self, shutdown, self.processes, shutdown_timeout)
         self.manager_stopped = threading.Event()
         self.failed_proc_name: str | None = None
 
@@ -983,6 +984,7 @@ def launch_core_engines(
     log_stats: bool,
     addresses: EngineZmqAddresses,
     num_api_servers: int = 1,
+    shutdown_timeout: float = 5.0,
 ) -> Iterator[
     tuple[
         CoreEngineProcManager | CoreEngineActorManager | None,
@@ -1023,6 +1025,7 @@ def launch_core_engines(
         coordinator = DPCoordinator(
             parallel_config,
             enable_wave_coordination=vllm_config.model_config.is_moe,
+            shutdown_timeout=shutdown_timeout,
         )
 
         addresses.coordinator_input, addresses.coordinator_output = (
@@ -1109,6 +1112,7 @@ def launch_core_engines(
                 start_index=dp_rank,
                 local_start_index=local_start_index or 0,
                 tensor_queue=tensor_queue,
+                shutdown_timeout=shutdown_timeout,
             )
         else:
             local_engine_manager = None

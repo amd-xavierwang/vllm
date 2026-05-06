@@ -57,6 +57,7 @@ class LLMEngine:
         stat_loggers: list[StatLoggerFactory] | None = None,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
         multiprocess_mode: bool = False,
+        shutdown_timeout: float = 5.0,
     ) -> None:
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -107,6 +108,7 @@ class LLMEngine:
             vllm_config=vllm_config,
             executor_class=executor_class,
             log_stats=self.log_stats,
+            shutdown_timeout=shutdown_timeout,
         )
 
         self.logger_manager: StatLoggerManager | None = None
@@ -174,6 +176,7 @@ class LLMEngine:
             usage_context=usage_context,
             stat_loggers=stat_loggers,
             multiprocess_mode=enable_multiprocessing,
+            shutdown_timeout=engine_args.shutdown_timeout,
         )
 
     def get_num_unfinished_requests(self) -> int:

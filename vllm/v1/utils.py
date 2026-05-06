@@ -29,7 +29,7 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.usage.usage_lib import UsageContext, is_usage_stats_enabled, usage_message
 from vllm.utils.network_utils import get_open_port, get_open_zmq_ipc_path, get_tcp_uri
-from vllm.utils.system_utils import decorate_logs, kill_process_tree, set_process_title
+from vllm.utils.system_utils import decorate_logs, kill_process_tree, terminate_process_tree, set_process_title
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
@@ -223,9 +223,12 @@ class APIServerProcessManager:
 
         logger.info("Started %d API server processes", len(self.processes))
 
+        # Get shutdown timeout from args, default to 5.0 if not present
+        shutdown_timeout = getattr(args, 'shutdown_timeout', 5.0)
+
         # Shutdown only the API server processes on garbage collection
         # The extra processes are managed by their owners
-        self._finalizer = weakref.finalize(self, shutdown, self.processes)
+        self._finalizer = weakref.finalize(self, shutdown, self.processes, shutdown_timeout)
 
     def shutdown(self, timeout: float | None = None) -> None:
         """Shutdown API server processes with configurable timeout"""
@@ -338,12 +341,12 @@ def shutdown(procs: list[BaseProcess], timeout: float | None = None) -> None:
     # Allow at least 5 seconds for remaining procs to terminate.
     timeout = max(timeout, 5.0)
 
-    # Shutdown the process.
+    # Shutdown the process tree by sending SIGTERM to parent and all children.
     for proc in procs:
-        if proc.is_alive():
-            proc.terminate()
+        if proc.is_alive() and (pid := proc.pid) is not None:
+            terminate_process_tree(pid)
 
-    # Allow time for remaining procs to terminate.
+    # Allow timeout seconds for remaining procs to terminate.
     deadline = time.monotonic() + timeout
     for proc in procs:
         remaining = deadline - time.monotonic()
@@ -352,6 +355,7 @@ def shutdown(procs: list[BaseProcess], timeout: float | None = None) -> None:
         if proc.is_alive():
             proc.join(remaining)
 
+    # Force kill any processes (and their children) that didn't terminate gracefully.
     for proc in procs:
         if proc.is_alive() and (pid := proc.pid) is not None:
             kill_process_tree(pid)
