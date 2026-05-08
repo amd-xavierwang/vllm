@@ -1156,6 +1156,209 @@ __global__ void wvSplitK_hf_big_(const int K, const int Kbp, const int Kap,
 }
 #endif
 
+// ============================================================
+// MoE fused wvSplitK: one kernel launch for all expert blocks.
+// blockIdx.y selects the expert block; weight pointers are offset
+// by expert_id * expert_stride.  Activations are gathered via
+// sorted_token_ids when in scattered mode.
+// ============================================================
+#if defined(__HIP__GFX9__) || defined(__HIP__GFX1X__)
+template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
+          int UNRL, int N>
+__global__ void __launch_bounds__(WvPrGrp* THRDS)
+    moe_wvSplitK_hf_sml_(const int K, const int Kbp, const int M,
+                          const scalar_t* __restrict__ B_base,
+                          const scalar_t* __restrict__ A_base,
+                          scalar_t* C_base,
+                          const int* __restrict__ expert_ids,
+                          const int* __restrict__ sorted_token_ids,
+                          const int top_k,
+                          const long expert_stride_b,
+                          const int A_stride,
+                          const int C_stride,
+                          const int block_size_m,
+                          const int _WvPrGrp, const int CuCount) {
+  constexpr int max_lds_len = LDS_SIZE / 2;
+#if defined(__HIP__MI3XX__)
+  constexpr bool use_mfma = (std::is_same_v<scalar_t, __hip_bfloat16>);
+#else
+  constexpr bool use_mfma = false;
+#endif
+  using scalar8 =
+      __attribute__((__vector_size__((A_CHUNK / 2) * sizeof(float)))) float;
+  using half4 =
+      __attribute__((__vector_size__((A_CHUNK / 2) * sizeof(__bf16)))) __bf16;
+  union bigType {
+    scalar_t h[A_CHUNK];
+    float f[A_CHUNK / 2];
+    float2 f2[A_CHUNK / 4];
+    double d[A_CHUNK / 4];
+    half4 h4[A_CHUNK / 4];
+    scalar8 h8;
+  };
+
+  // Expert dispatch via blockIdx.y
+  const int expert_block = blockIdx.y;
+  const int expert_id = expert_ids[expert_block];
+  if (expert_id < 0) return;  // skip invalid/padding blocks
+
+  // Offset weight pointer to this expert
+  const scalar_t* B = B_base + expert_id * expert_stride_b;
+
+  // Gather activation rows for this expert block into LDS
+  // In scattered mode: sorted_token_ids maps slot -> original token
+  // block_start = expert_block * block_size_m (each expert block has block_size_m slots)
+  const int slot_start = expert_block * block_size_m;
+  const int Kap = K;  // activation stride (contiguous)
+
+  __shared__ scalar_t s[max_lds_len];
+
+  // Load activation for each token in this block
+  for (int tok = 0; tok < block_size_m && tok < N; tok++) {
+    int slot = slot_start + tok;
+    int src_row;
+    if (sorted_token_ids != nullptr) {
+      src_row = sorted_token_ids[slot] / top_k;
+    } else {
+      src_row = slot;
+    }
+    const scalar_t* A_row = A_base + src_row * A_stride;
+    for (uint32_t k = (threadIdx.y * THRDS + threadIdx.x) * A_CHUNK;
+         k < (uint32_t)K; k += THRDS * WvPrGrp * A_CHUNK) {
+      *((bigType*)(&s[k + Kap * tok])) = *((const bigType*)(&A_row[k]));
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.y >= _WvPrGrp) return;
+
+  uint32_t m = (blockIdx.x * _WvPrGrp + (threadIdx.y % _WvPrGrp)) * YTILE;
+
+  while (m < (uint32_t)M) {
+    float sum[N][YTILE] = {};
+    scalar8 sum4[N][YTILE] = {};
+
+    for (uint32_t k1 = 0; k1 < (uint32_t)K; k1 += THRDS * A_CHUNK * UNRL) {
+      bigType bigA[N][UNRL] = {};
+      bigType bigB[YTILE][UNRL];
+#pragma unroll
+      for (uint32_t k2 = 0; k2 < UNRL; k2++) {
+        uint32_t k = k1 + k2 * THRDS * A_CHUNK;
+        uint32_t k_ = k + threadIdx.x * A_CHUNK;
+        const scalar_t* B_ = &B[min__(k_, (uint32_t)(K - A_CHUNK))];
+        for (int y = 0; y < YTILE; y++)
+          bigB[y][k2].h8 = (loadnt((scalar8*)(&B_[min__(y + m, (uint32_t)(M - 1)) * Kbp])));
+      }
+
+#pragma unroll
+      for (uint32_t k2 = 0; k2 < UNRL; k2++) {
+        uint32_t k = k1 + k2 * THRDS * A_CHUNK;
+        uint32_t k_ = k + threadIdx.x * A_CHUNK;
+        if (k_ >= (uint32_t)K) break;
+        for (int n = 0; n < N; n++) {
+          bigA[n][k2] = *((const bigType*)(&(s[k_ + Kap * n])));
+        }
+      }
+
+      for (uint32_t k2 = 0; k2 < UNRL; k2++) {
+        for (uint32_t n = 0; n < N; n++) {
+          for (int y = 0; y < YTILE; y++) {
+            if constexpr (!use_mfma)
+              for (uint32_t b = 0; b < A_CHUNK / 2; b++) {
+                DOT2C(sum[n][y], bigA[n][k2].f[b], bigB[y][k2].f[b])
+              }
+            else
+              for (uint32_t b = 0; b < A_CHUNK / 4; b++)
+                sum4[n][y] = __builtin_amdgcn_mfma_f32_4x4x4bf16_1k(
+                    bigA[n][k2].h4[b], bigB[y][k2].h4[b], sum4[n][y], 0, 0, 0);
+          }
+        }
+      }
+    }
+    __builtin_amdgcn_sched_barrier(0);
+
+    // Reduction and write output
+    if constexpr (!use_mfma) {
+      for (int n = 0; n < N; n++) {
+        for (int y = 0; y < YTILE; y++) {
+          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x118, 0xf, 0xf, 1);
+          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x114, 0xf, 0xf, 1);
+          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x112, 0xf, 0xf, 1);
+          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x111, 0xf, 0xf, 1);
+#if defined(__HIP__GFX9__)
+          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x142, 0xf, 0xf, 1);
+          sum[n][y] += __builtin_amdgcn_mov_dpp(sum[n][y], 0x143, 0xf, 0xf, 1);
+#else
+          sum[n][y] += __shfl_xor(sum[n][y], 16);
+#endif
+        }
+      }
+
+      if (threadIdx.x == (THRDS - 1)) {
+        for (int n = 0; n < N; n++) {
+          for (int y = 0; y < YTILE; y++) {
+            // Write to output: C[slot, weight_row]
+            int slot = slot_start + n;
+            int out_col = m + y;
+            if (out_col < M && n < block_size_m) {
+              C_base[slot * C_stride + out_col] = __float2s<scalar_t>(sum[n][y]);
+            }
+          }
+        }
+      }
+    } else {
+#ifdef __HIP__GFX9__
+#pragma unroll
+      for (int n = 0; n < N; n++) {
+#pragma unroll
+        for (int y = 0; y < YTILE; y++) {
+          float accm = sum4[n][y][0];
+          accm += __builtin_amdgcn_mov_dpp(sum4[n][y][1], 0x101, 0xf, 0xf, 1);
+          accm += __builtin_amdgcn_mov_dpp(sum4[n][y][2], 0x102, 0xf, 0xf, 1);
+          accm += __builtin_amdgcn_mov_dpp(sum4[n][y][3], 0x103, 0xf, 0xf, 1);
+          accm += __builtin_amdgcn_mov_dpp(accm, 0x104, 0xf, 0xf, 1);
+          accm += __builtin_amdgcn_mov_dpp(accm, 0x108, 0xf, 0xf, 1);
+          accm = __builtin_amdgcn_mov_dpp(accm, 0x11f, 0xf, 0xf, 1);
+          accm += __builtin_amdgcn_mov_dpp(accm, 0x142, 0xf, 0xf, 1);
+          accm += __builtin_amdgcn_mov_dpp(accm, 0x143, 0xf, 0xf, 1);
+          sum4[n][y][0] = accm;
+        }
+      }
+      if (threadIdx.x == (THRDS - 1)) {
+        for (int n = 0; n < N; n++) {
+          for (int y = 0; y < YTILE; y++) {
+            int slot = slot_start + n;
+            int out_col = m + y;
+            if (out_col < M && n < block_size_m) {
+              C_base[slot * C_stride + out_col] = __float2bfloat16(sum4[n][y][0]);
+            }
+          }
+        }
+      }
+#endif  // __HIP__GFX9__ (MFMA path)
+    }
+    m += CuCount * _WvPrGrp * YTILE;
+  }
+}
+#else
+template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
+          int UNRL, int N>
+__global__ void moe_wvSplitK_hf_sml_(const int K, const int Kbp, const int M,
+                          const scalar_t* __restrict__ B_base,
+                          const scalar_t* __restrict__ A_base,
+                          scalar_t* C_base,
+                          const int* __restrict__ expert_ids,
+                          const int* __restrict__ sorted_token_ids,
+                          const int top_k,
+                          const long expert_stride_b,
+                          const int A_stride,
+                          const int C_stride,
+                          const int block_size_m,
+                          const int _WvPrGrp, const int CuCount) {
+  UNREACHABLE_CODE
+}
+#endif
+
 // Find the min val of div2 that doesn't increase N/(div1*div2)
 int mindiv(int N, int div1, int div2) {
   int nPrRnd = div1 * div2;
@@ -1284,6 +1487,110 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
     }
   });
   return out_c;
+}
+
+// ============================================================
+// MoE fused wvSplitK host function for bf16/fp16
+// Single launch with grid.y = num_expert_blocks
+// ============================================================
+
+#define MOE_WVSPLITK_HF_CFG(_THRDS, _WVPRGRP, _YTILE, _UNRL, _N)              \
+  {                                                                             \
+    dim3 block(_THRDS, _WVPRGRP);                                               \
+    int __wvPrGrp = mindiv(M_in, CuCount * _YTILE, _WVPRGRP);                  \
+    dim3 grid(CuCount, num_expert_blocks);                                      \
+    moe_wvSplitK_hf_sml_<fptype, _THRDS, _YTILE, _WVPRGRP, 8, _UNRL, _N>      \
+        <<<grid, block, 0, stream>>>(                                           \
+            K_in, Kbp_in, M_in, bptr, aptr, cptr, eidptr, stidptr, top_k_in,   \
+            expert_stride_b, A_stride, C_stride, block_size_m,                  \
+            __wvPrGrp, CuCount);                                                \
+  }
+
+#define MOE_WVSPLIT_HF_TILE(_THRDS, _WVPRGRP, _sYT, __N)  \
+  {                                        \
+    if (_sYT <= 1)                         \
+      MOE_WVSPLITK_HF_CFG(_THRDS, _WVPRGRP, 1, 4, __N)  \
+    else if ((__N == 1) || (_sYT <= 4 * 2)) \
+      MOE_WVSPLITK_HF_CFG(_THRDS, _WVPRGRP, 2, 2, __N)  \
+    else if (_sYT <= 4 * 3)                \
+      MOE_WVSPLITK_HF_CFG(_THRDS, _WVPRGRP, 3, 2, __N)  \
+    else if (__N == 4)                     \
+      MOE_WVSPLITK_HF_CFG(_THRDS, _WVPRGRP, 4, 1, __N)  \
+    else                                   \
+      MOE_WVSPLITK_HF_CFG(_THRDS, _WVPRGRP, 4, 2, __N)  \
+  }
+
+void moe_wvSplitK(const at::Tensor& in_a,      // activations [M_total, K]
+                   const at::Tensor& in_b,      // weights [E, N_weight, K]
+                   at::Tensor& out_c,           // output [M_total, N_weight]
+                   const at::Tensor& expert_ids, // [num_expert_blocks]
+                   const at::Tensor& sorted_token_ids, // [num_slots] or empty
+                   int64_t top_k,
+                   int64_t block_size_m,
+                   int64_t CuCount) {
+  // Weight shape: [E, M_weight, K] where M_weight is the "M" dim for wvSplitK
+  auto M_in = static_cast<int>(in_b.size(1));   // N_weight = wvSplitK's M
+  auto K_in = static_cast<int>(in_b.size(2));   // K dimension
+  auto N_in = static_cast<int>(block_size_m);   // tokens per block = wvSplitK's N
+  auto Kbp_in = static_cast<int>(in_b.stride(1)); // stride between weight rows
+  auto num_expert_blocks = static_cast<int>(expert_ids.size(0));
+
+  int A_stride = static_cast<int>(in_a.stride(0));
+  int C_stride = static_cast<int>(out_c.stride(0));
+  long expert_stride_b = static_cast<long>(in_b.stride(0));
+
+  bool scattered = sorted_token_ids.numel() > 0;
+  int top_k_in = scattered ? static_cast<int>(top_k) : 1;
+
+  TORCH_CHECK(in_a.dtype() == in_b.dtype());
+  TORCH_CHECK(K_in % 8 == 0, "K must be multiple of 8");
+  TORCH_CHECK(in_a.dtype() == torch::kFloat16 || in_a.dtype() == torch::kBFloat16);
+  TORCH_CHECK(N_in >= 1 && N_in <= 4, "block_size_m must be 1-4");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(in_a));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  int sYT = (M_in + CuCount * 4 - 1) / (CuCount * 4);
+  const bool use_wave32 = on_gfx1x();
+
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(in_a.scalar_type(), "moe_wvSplitK", [&] {
+    using fptype = typename scalar<scalar_t>::type;
+    const fptype* bptr = reinterpret_cast<const fptype*>(in_b.data_ptr());
+    const fptype* aptr = reinterpret_cast<const fptype*>(in_a.data_ptr());
+    fptype* cptr = reinterpret_cast<fptype*>(out_c.data_ptr());
+    const int* eidptr = expert_ids.data_ptr<int32_t>();
+    const int* stidptr = scattered ? sorted_token_ids.data_ptr<int32_t>() : nullptr;
+
+    switch (N_in) {
+      case 1:
+        if (use_wave32)
+          MOE_WVSPLIT_HF_TILE(32, 16, sYT, 1)
+        else
+          MOE_WVSPLIT_HF_TILE(64, 16, sYT, 1)
+        break;
+      case 2:
+        if (use_wave32)
+          MOE_WVSPLIT_HF_TILE(32, 16, sYT, 2)
+        else
+          MOE_WVSPLIT_HF_TILE(64, 16, sYT, 2)
+        break;
+      case 3:
+        if (use_wave32)
+          MOE_WVSPLIT_HF_TILE(32, 16, sYT, 3)
+        else
+          MOE_WVSPLIT_HF_TILE(64, 16, sYT, 3)
+        break;
+      case 4:
+        if (use_wave32)
+          MOE_WVSPLIT_HF_TILE(32, 16, sYT, 4)
+        else
+          MOE_WVSPLIT_HF_TILE(64, 16, sYT, 4)
+        break;
+      default:
+        throw std::runtime_error(
+            "moe_wvSplitK: Unsupported block_size_m=" + std::to_string(N_in));
+    }
+  });
 }
 
 // This version targets cases skinny where CUs are not filled

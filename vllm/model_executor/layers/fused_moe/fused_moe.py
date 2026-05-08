@@ -1679,6 +1679,78 @@ def _get_config_quant_dtype(
     return None
 
 
+def _hip_skinny_moe_gemm(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    activation_enum: MoEActivation,
+    inplace: bool,
+    global_num_experts: int = -1,
+) -> torch.Tensor:
+    """Fused MoE using HIP wvSplitK for decode on ROCm (small M).
+
+    Launches a single HIP kernel per GEMM with grid.y = num_expert_blocks.
+    Per-expert token count (1-4) becomes wvSplitK's N dimension.
+    """
+    from vllm.utils.platform_utils import num_compute_units
+
+    M, K = hidden_states.shape
+    E, N, _ = w1.shape
+    K_out = w2.shape[1]
+    topk = topk_ids.shape[1]
+    cu_count = num_compute_units()
+    if global_num_experts == -1:
+        global_num_experts = E
+    act_out_dim = mk.FusedMoEExpertsModular.adjust_N_for_activation(
+        N, activation_enum
+    )
+
+    # Use block_size_m = 1 for scattered mode (like int4 path)
+    block_size_m = 1
+
+    # sorted_token_ids: identity mapping (scattered mode)
+    P = M * topk
+    sorted_token_ids = torch.arange(P, dtype=torch.int32,
+                                    device=hidden_states.device)
+    expert_ids = topk_ids.view(-1).to(torch.int32)
+
+    # Allocate workspaces
+    gemm1_out = torch.empty(P, N, device=hidden_states.device,
+                            dtype=hidden_states.dtype)
+    act_out = torch.empty(P, act_out_dim, device=hidden_states.device,
+                          dtype=hidden_states.dtype)
+    gemm2_out = torch.empty(P, K_out, device=hidden_states.device,
+                            dtype=hidden_states.dtype)
+
+    # GEMM1: fused across all expert blocks
+    ops.moe_wvSplitK(
+        hidden_states, w1, gemm1_out, expert_ids, sorted_token_ids,
+        topk, block_size_m, cu_count,
+    )
+
+    # Activation
+    apply_moe_activation(activation_enum, act_out, gemm1_out)
+
+    # GEMM2: fused across all expert blocks
+    ops.moe_wvSplitK(
+        act_out, w2, gemm2_out, expert_ids,
+        torch.empty(0, dtype=torch.int32, device=hidden_states.device),
+        1, block_size_m, cu_count,
+    )
+
+    # Weighted reduce: sum topk contributions per token
+    gemm2_out = gemm2_out.view(M, topk, K_out)
+    weights = topk_weights.unsqueeze(-1).to(hidden_states.dtype)
+    out = (gemm2_out * weights).sum(dim=1)
+
+    if inplace:
+        hidden_states.copy_(out)
+        return hidden_states
+    return out
+
+
 def fused_experts_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -1737,6 +1809,29 @@ def fused_experts_impl(
     top_k_num = topk_ids.size(1)
 
     M = num_tokens
+
+    # Hybrid decode path: use HIP wvSplitK for small M on ROCm
+    if (
+        current_platform.is_rocm()
+        and M <= 4
+        and not use_fp8_w8a8
+        and not use_int8_w8a8
+        and not use_int8_w8a16
+        and not use_int4_w4a16
+        and expert_map is None
+        and hidden_states.dtype in (torch.float16, torch.bfloat16)
+        and hidden_states.shape[1] % 8 == 0
+        and w2.shape[2] % 8 == 0
+    ):
+        return _hip_skinny_moe_gemm(
+            hidden_states,
+            w1,
+            w2,
+            topk_ids,
+            topk_weights,
+            activation_enum,
+            inplace,
+        )
 
     config_dtype = _get_config_dtype_str(
         use_fp8_w8a8=use_fp8_w8a8,

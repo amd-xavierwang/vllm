@@ -39,6 +39,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "          Tensor scale_b, int CuCount) -> ()");
   rocm_ops.impl("wvSplitKQ", torch::kCUDA, &wvSplitKQ);
 
+  // MoE fused wvSplitK for bf16/fp16
+  rocm_ops.def(
+      "moe_wvSplitK(Tensor in_a, Tensor in_b, Tensor(a!) out_c, "
+      "Tensor expert_ids, Tensor sorted_token_ids, int top_k, "
+      "int block_size_m, int CuCount) -> ()");
+  rocm_ops.impl("moe_wvSplitK", torch::kCUDA, &moe_wvSplitK);
+
   // Custom attention op
   // Compute the attention between an input query and the cached
   // keys/values using PagedAttention.

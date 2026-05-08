@@ -2337,6 +2337,21 @@ def wvSplitKQ(
     return out
 
 
+def moe_wvSplitK(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    out: torch.Tensor,
+    expert_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    top_k: int,
+    block_size_m: int,
+    cu_count: int,
+) -> None:
+    torch.ops._rocm_C.moe_wvSplitK(
+        a, b, out, expert_ids, sorted_token_ids, top_k, block_size_m, cu_count
+    )
+
+
 # moe
 def moe_sum(input: torch.Tensor, output: torch.Tensor):
     torch.ops._moe_C.moe_sum(input, output)

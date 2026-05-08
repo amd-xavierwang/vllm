@@ -18,6 +18,11 @@ void wvSplitKQ(const at::Tensor& in_a, const at::Tensor& in_b,
                const at::Tensor& scale_a, const at::Tensor& scale_b,
                const int64_t CuCount);
 
+void moe_wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
+                   at::Tensor& out_c, const at::Tensor& expert_ids,
+                   const at::Tensor& sorted_token_ids, int64_t top_k,
+                   int64_t block_size_m, int64_t CuCount);
+
 void paged_attention(
     torch::Tensor& out, torch::Tensor& exp_sums, torch::Tensor& max_logits,
     torch::Tensor& tmp_out, torch::Tensor& query, torch::Tensor& key_cache,
