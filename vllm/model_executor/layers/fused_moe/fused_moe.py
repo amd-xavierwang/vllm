@@ -1813,7 +1813,7 @@ def fused_experts_impl(
     # Hybrid decode path: use HIP wvSplitK for small M on ROCm
     if (
         current_platform.is_rocm()
-        and M <= 4
+        and M <= 5
         and not use_fp8_w8a8
         and not use_int8_w8a8
         and not use_int8_w8a16
