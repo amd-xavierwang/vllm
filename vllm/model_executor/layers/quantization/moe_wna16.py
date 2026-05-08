@@ -362,6 +362,76 @@ class MoeWNA16Method(FusedMoEMethodBase):
             block_shape=[0, layer.group_size],
         )
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        if (
+            not current_platform.is_rocm()
+            or self.quant_config.weight_bits != 4
+        ):
+            return
+
+        def _repack_int4_to_int32(w: torch.Tensor) -> torch.Tensor:
+            """Repack [E, N, K//2] uint8 → [E, K, N//8] int32.
+
+            Input: K-packed uint8 (2 int4 per byte, low nibble first).
+            Output: N-packed int32 (8 int4 per int32, GPTQ sequential shifts
+                    [0,4,...,28]).
+            """
+            E, N, K_half = w.shape
+            K = K_half * 2
+            lo = (w & 0xF).to(torch.int32)
+            hi = ((w >> 4) & 0xF).to(torch.int32)
+            unpacked = torch.stack([lo, hi], dim=-1).reshape(E, N, K)
+            transposed = unpacked.permute(0, 2, 1).contiguous()
+            N8 = N // 8
+            shifts = torch.arange(8, device=w.device, dtype=torch.int32) * 4
+            packed = (
+                transposed.view(E, K, N8, 8) << shifts
+            ).sum(dim=-1, dtype=torch.int32)
+            return packed.contiguous()
+
+        def _repack_zp_int4_to_int32(zp: torch.Tensor) -> torch.Tensor:
+            """Repack [E, N//2, K_groups] uint8 → [E, K_groups, N//8] int32."""
+            E, N_half, K_groups = zp.shape
+            N = N_half * 2
+            lo = (zp & 0xF).to(torch.int32)
+            hi = ((zp >> 4) & 0xF).to(torch.int32)
+            unpacked = torch.stack([lo, hi], dim=-1).reshape(E, N, K_groups)
+            transposed = unpacked.permute(0, 2, 1).contiguous()
+            N8 = N // 8
+            shifts = torch.arange(8, device=zp.device, dtype=torch.int32) * 4
+            packed = (
+                transposed.view(E, K_groups, N8, 8) << shifts
+            ).sum(dim=-1, dtype=torch.int32)
+            return packed.contiguous()
+
+        for qw_name in ("w13_qweight", "w2_qweight"):
+            old = getattr(layer, qw_name)
+            new_data = _repack_int4_to_int32(old.data)
+            layer.register_parameter(
+                qw_name,
+                torch.nn.Parameter(new_data, requires_grad=False),
+            )
+
+        for sc_name in ("w13_scales", "w2_scales"):
+            old = getattr(layer, sc_name)
+            new_data = old.data.permute(0, 2, 1).contiguous()
+            layer.register_parameter(
+                sc_name,
+                torch.nn.Parameter(new_data, requires_grad=False),
+            )
+
+        if self.quant_config.has_zp:
+            for zp_name in ("w13_qzeros", "w2_qzeros"):
+                old = getattr(layer, zp_name)
+                new_data = _repack_zp_int4_to_int32(old.data)
+                layer.register_parameter(
+                    zp_name,
+                    torch.nn.Parameter(new_data, requires_grad=False),
+                )
+
+        layer._rocm_int4_interleave = True
+
     def apply(
         self,
         layer: FusedMoE,

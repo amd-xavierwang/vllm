@@ -76,6 +76,202 @@ def write_zeros_to_output(
 
 
 @triton.jit
+def fused_moe_kernel_gptq_awq_interleave(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    b_scale_ptr,
+    b_zp_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    EM,
+    num_valid_tokens,
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_bse,
+    stride_bsk,
+    stride_bsn,
+    stride_bze,
+    stride_bzk,
+    stride_bzn,
+    block_k_diviable: tl.constexpr,
+    group_size: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+    has_zp: tl.constexpr,
+):
+    """
+    ROCm-optimized MoE int4 kernel using tl.interleave for weight unpacking.
+
+    Expects N-packed int32 weights [E, K, N//8] with GPTQ sequential packing,
+    scales [E, K//group_size, N], and qzeros [E, K//group_size, N//8] int32.
+    """
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(
+        tl.int64
+    )
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id).to(tl.int64)
+    token_mask = offs_token < num_valid_tokens
+
+    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if off_experts == -1:
+        write_zeros_to_output(
+            c_ptr,
+            stride_cm,
+            stride_cn,
+            pid_n,
+            N,
+            offs_token,
+            token_mask,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            compute_type,
+        )
+        return
+
+    offs_bn = (
+        pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+    ) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + (
+        offs_token[:, None] // top_k * stride_am
+        + offs_k[None, :] * stride_ak
+    )
+
+    # B layout: [E, K, N//8] int32 — N-packed, 8 int4 per int32
+    offs_bn_packed = (
+        pid_n * (BLOCK_SIZE_N // 8)
+        + tl.arange(0, BLOCK_SIZE_N // 8).to(tl.int64)
+    )
+    b_ptrs = (
+        b_ptr
+        + off_experts * stride_be
+        + offs_k[:, None] * stride_bk
+        + offs_bn_packed[None, :] * stride_bn
+    )
+
+    # Precompute GPTQ sequential shifts: [0,4,8,...,28] tiled to BLOCK_N
+    shifts_row = tl.arange(0, 8) * 4
+    shifts_1d_2d = tl.broadcast_to(
+        shifts_row[None, :], (BLOCK_SIZE_N // 8, 8)
+    )
+    shifts_1d = tl.reshape(shifts_1d_2d, (BLOCK_SIZE_N,))
+    shifts = tl.broadcast_to(shifts_1d[None, :], (BLOCK_SIZE_K, BLOCK_SIZE_N))
+
+    if not has_zp:
+        b_zp_num = 8
+    elif has_zp:
+        # Zeros are [E, K_groups, N//8] int32, same interleave pattern
+        zp_shifts_1d = shifts_1d
+
+    # Scale offsets: scales are [E, K_groups, N] after repacking
+    offs_sn = (
+        pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
+    ) % N
+
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        if not block_k_diviable:
+            k_mask = offs_k[:, None] < K - k * BLOCK_SIZE_K
+            k_other = 0.0
+        else:
+            k_mask = None
+            k_other = None
+
+        a = tl.load(
+            a_ptrs,
+            mask=token_mask[:, None]
+            & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+            other=0.0,
+        )
+
+        # Load packed weights [BLOCK_K, BLOCK_N//8] int32
+        b_packed = tl.load(b_ptrs)
+        # Unpack via 3x interleave → [BLOCK_K, BLOCK_N]
+        b = tl.interleave(b_packed, b_packed)
+        b = tl.interleave(b, b)
+        b = tl.interleave(b, b)
+        b = (b >> shifts) & 0xF
+
+        # Scales: [E, K_groups, N] — load [BLOCK_K, BLOCK_N]
+        g_idx = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
+        b_scale_ptrs = (
+            b_scale_ptr
+            + off_experts * stride_bse
+            + g_idx * stride_bsk
+            + offs_sn[None, :] * stride_bsn
+        )
+        b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
+        b_scale = b_scale.to(tl.float32)
+
+        if has_zp:
+            # Zeros: [E, K_groups, N//8] int32
+            g_idx_zp = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
+            b_zp_ptrs = (
+                b_zp_ptr
+                + off_experts * stride_bze
+                + g_idx_zp * stride_bzk
+                + offs_bn_packed[None, :] * stride_bzn
+            )
+            b_zp_packed = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
+            b_zp = tl.interleave(b_zp_packed, b_zp_packed)
+            b_zp = tl.interleave(b_zp, b_zp)
+            b_zp = tl.interleave(b_zp, b_zp)
+            b_zp = (b_zp >> shifts) & 0xF
+            b_zp = b_zp.to(tl.float32)
+
+        if has_zp:
+            b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
+        else:
+            b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
+        accumulator = tl.dot(a, b, acc=accumulator)
+
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += BLOCK_SIZE_K * stride_bk
+
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(
+            topk_weights_ptr + offs_token, mask=token_mask, other=0
+        )
+        accumulator = accumulator * moe_weight[:, None]
+
+    accumulator = accumulator.to(compute_type)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = (
+        c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    )
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+@triton.jit
 def fused_moe_kernel_gptq_awq(
     # Pointers to matrices
     a_ptr,
@@ -658,69 +854,122 @@ def invoke_fused_moe_wna16_triton_kernel(
     M = A.size(0)
     num_tokens = M * top_k
 
+    # After ROCm int4 repacking: B is [E, K, N//8] int32, scales [E, K_g, N]
+    use_interleave = (
+        current_platform.is_rocm()
+        and use_int4_w4a16
+        and B.dtype == torch.int32
+    )
+
+    if use_interleave:
+        N_out = B_scale.size(2)
+    else:
+        N_out = B.size(1)
+
     EM = sorted_token_ids.size(0)
     if A.size(0) < config["BLOCK_SIZE_M"]:
-        # optimize for small batch_size.
-        # We assume that top_ids of each token is unique,
-        # so num_valid_experts <= batch_size <= BLOCK_SIZE_M,
-        # and we can skip some invalid blocks.
         EM = min(sorted_token_ids.size(0), A.size(0) * top_k * config["BLOCK_SIZE_M"])
     grid = lambda META: (
         triton.cdiv(EM, META["BLOCK_SIZE_M"])
-        * triton.cdiv(B.size(1), META["BLOCK_SIZE_N"]),
+        * triton.cdiv(N_out, META["BLOCK_SIZE_N"]),
     )
     config = config.copy()
-    config.update(
-        get_moe_wna16_block_config(
-            config=config,
-            use_moe_wna16_cuda=False,
-            num_valid_tokens=num_tokens,
-            size_k=A.size(1),
-            size_n=B.size(1),
-            num_experts=B.size(1),
-            group_size=block_shape[1],
-            real_top_k=top_k,
-            block_size_m=config["BLOCK_SIZE_M"],
+    if use_interleave:
+        # Interleave kernel needs BLOCK_N to be power-of-2 multiple of 8,
+        # and performs best at BLOCK_N=64 with BLOCK_K=32 on RDNA3.
+        config.update({"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32})
+    else:
+        config.update(
+            get_moe_wna16_block_config(
+                config=config,
+                use_moe_wna16_cuda=False,
+                num_valid_tokens=num_tokens,
+                size_k=A.size(1),
+                size_n=N_out,
+                num_experts=B.size(0),
+                group_size=block_shape[1],
+                real_top_k=top_k,
+                block_size_m=config["BLOCK_SIZE_M"],
+            )
         )
-    )
 
-    fused_moe_kernel_gptq_awq[grid](
-        A,
-        B,
-        C,
-        B_scale,
-        B_zp,
-        topk_weights,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        B.size(1),
-        A.size(1),
-        EM,
-        num_tokens,
-        A.stride(0),
-        A.stride(1),
-        B.stride(0),
-        B.stride(2),
-        B.stride(1),
-        C.stride(1),
-        C.stride(2),
-        B_scale.stride(0),
-        B_scale.stride(2),
-        B_scale.stride(1),
-        B_zp.stride(0) if B_zp is not None else 0,
-        B_zp.stride(2) if B_zp is not None else 0,
-        B_zp.stride(1) if B_zp is not None else 0,
-        block_k_diviable=A.size(1) % config["BLOCK_SIZE_K"] == 0,
-        group_size=block_shape[1],
-        MUL_ROUTED_WEIGHT=mul_routed_weight,
-        top_k=top_k,
-        compute_type=compute_type,
-        has_zp=B_zp is not None,
-        use_int4_w4a16=use_int4_w4a16,
-        use_int8_w8a16=use_int8_w8a16,
-        **config,
-    )
+    if use_interleave:
+        # B: [E, K, N//8] int32 — stride(0)=expert, stride(1)=K, stride(2)=N_packed
+        # B_scale: [E, K_groups, N] — stride(0)=expert, stride(1)=K_groups, stride(2)=N
+        # B_zp: [E, K_groups, N//8] int32 — same as B for packed dim
+        fused_moe_kernel_gptq_awq_interleave[grid](
+            A,
+            B,
+            C,
+            B_scale,
+            B_zp if B_zp is not None else B,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            N_out,
+            A.size(1),
+            EM,
+            num_tokens,
+            A.stride(0),
+            A.stride(1),
+            B.stride(0),
+            B.stride(1),
+            B.stride(2),
+            C.stride(1),
+            C.stride(2),
+            B_scale.stride(0),
+            B_scale.stride(1),
+            B_scale.stride(2),
+            B_zp.stride(0) if B_zp is not None else 0,
+            B_zp.stride(1) if B_zp is not None else 0,
+            B_zp.stride(2) if B_zp is not None else 0,
+            block_k_diviable=A.size(1) % config["BLOCK_SIZE_K"] == 0,
+            group_size=block_shape[1],
+            MUL_ROUTED_WEIGHT=mul_routed_weight,
+            top_k=top_k,
+            compute_type=compute_type,
+            has_zp=B_zp is not None,
+            **config,
+        )
+    else:
+        fused_moe_kernel_gptq_awq[grid](
+            A,
+            B,
+            C,
+            B_scale,
+            B_zp,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            N_out,
+            A.size(1),
+            EM,
+            num_tokens,
+            A.stride(0),
+            A.stride(1),
+            B.stride(0),
+            B.stride(2),
+            B.stride(1),
+            C.stride(1),
+            C.stride(2),
+            B_scale.stride(0),
+            B_scale.stride(2),
+            B_scale.stride(1),
+            B_zp.stride(0) if B_zp is not None else 0,
+            B_zp.stride(2) if B_zp is not None else 0,
+            B_zp.stride(1) if B_zp is not None else 0,
+            block_k_diviable=A.size(1) % config["BLOCK_SIZE_K"] == 0,
+            group_size=block_shape[1],
+            MUL_ROUTED_WEIGHT=mul_routed_weight,
+            top_k=top_k,
+            compute_type=compute_type,
+            has_zp=B_zp is not None,
+            use_int4_w4a16=use_int4_w4a16,
+            use_int8_w8a16=use_int8_w8a16,
+            **config,
+        )
 
 
 def invoke_fused_moe_triton_kernel(
@@ -1327,6 +1576,7 @@ def try_get_optimal_moe_config(
     dtype: str | None,
     M: int,
     block_shape: list[int] | None = None,
+    N_override: int | None = None,
 ) -> dict[str, int]:
     from vllm.model_executor.layers.fused_moe import get_config
 
@@ -1335,9 +1585,13 @@ def try_get_optimal_moe_config(
         config = override_config
     else:
         # First try to load optimal config from the file
-        E, _, N = w2_shape
-        if dtype == "int4_w4a16":
-            N = N * 2
+        if N_override is not None:
+            E = w2_shape[0]
+            N = N_override
+        else:
+            E, _, N = w2_shape
+            if dtype == "int4_w4a16":
+                N = N * 2
         block_n = block_shape[0] if block_shape else 0
         block_k = block_shape[1] if block_shape else 0
         configs = get_moe_configs(E, N, dtype, block_n, block_k)
@@ -1348,7 +1602,8 @@ def try_get_optimal_moe_config(
             config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
         else:
             # Else use the default config
-            config = get_default_config(M, E, N, w1_shape[2], top_k, dtype, block_shape)
+            config = get_default_config(
+                M, E, N, w1_shape[2], top_k, dtype, block_shape)
     return config
 
 
@@ -1716,7 +1971,13 @@ def fused_experts_impl(
     activation_enum = MoEActivation.from_str(activation)
 
     # Check constraints.
-    if use_int4_w4a16:
+    # Detect ROCm int4 interleave layout: w1 is [E, K, N//8] int32
+    _rocm_interleave = (use_int4_w4a16 and w1.dtype == torch.int32)
+    if _rocm_interleave:
+        assert hidden_states.size(1) == w1.size(1), (
+            f"Hidden size mismatch {hidden_states.size(1)} != {w1.size(1)}"
+        )
+    elif use_int4_w4a16:
         assert hidden_states.size(1) // 2 == w1.size(2), "Hidden size mismatch"
     else:
         assert hidden_states.size(1) == w1.size(2), (
@@ -1730,8 +1991,13 @@ def fused_experts_impl(
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
 
     num_tokens = hidden_states.size(0)
-    E, N, _ = w1.size()
-    K = w2.size(1)
+    if _rocm_interleave:
+        E = w1.size(0)
+        N = w1_scale.size(2) if w1_scale is not None else w1.size(2) * 8
+        K = w1.size(1)
+    else:
+        E, N, _ = w1.size()
+        K = w2.size(1)
     if global_num_experts == -1:
         global_num_experts = E
     top_k_num = topk_ids.size(1)
@@ -1760,6 +2026,7 @@ def fused_experts_impl(
         top_k_num,
         config_dtype,
         block_shape=block_shape,
+        N_override=N if _rocm_interleave else None,
     )
 
     config = get_config_func(M)
@@ -2003,7 +2270,13 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         apply_router_weight_on_input: bool,
     ):
         # Check constraints.
-        if self.quant_config.use_int4_w4a16:
+        _rocm_interleave = (self.quant_config.use_int4_w4a16
+                            and w1.dtype == torch.int32)
+        if _rocm_interleave:
+            assert hidden_states.size(-1) == w1.size(1), (
+                f"Hidden size mismatch {hidden_states.size(-1)} != {w1.size(1)}"
+            )
+        elif self.quant_config.use_int4_w4a16:
             assert hidden_states.size(-1) // 2 == w1.size(2), "Hidden size mismatch"
         else:
             assert hidden_states.size(-1) == w1.size(2), (
@@ -2036,6 +2309,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             self.quant_config.config_name(hidden_states.dtype),
             num_tokens,
             block_shape=self.block_shape,
+            N_override=N if _rocm_interleave else None,
         )
 
         if hidden_states.dtype == torch.bfloat16:
@@ -2227,6 +2501,22 @@ class TritonWNA16Experts(TritonExperts):
             "This method should not be called."
         )
 
+    def moe_problem_size(
+        self,
+        a1: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[int, int, int, int, int]:
+        if self.quant_config.use_int4_w4a16 and w1.dtype == torch.int32:
+            E = w1.size(0)
+            N = w1.size(2) * 8
+            K = a1.size(-1)
+            num_tokens = a1.size(0) if a1.dim() == 2 else a1.size(1)
+            top_k_num = topk_ids.size(1)
+            return E, num_tokens, N, K, top_k_num
+        return super().moe_problem_size(a1, w1, w2, topk_ids)
+
     def apply(
         self,
         output: torch.Tensor,
@@ -2246,7 +2536,13 @@ class TritonWNA16Experts(TritonExperts):
         apply_router_weight_on_input: bool,
     ):
         # Check constraints.
-        if self.quant_config.use_int4_w4a16:
+        _rocm_interleave = (self.quant_config.use_int4_w4a16
+                            and w1.dtype == torch.int32)
+        if _rocm_interleave:
+            assert hidden_states.size(-1) == w1.size(1), (
+                f"Hidden size mismatch {hidden_states.size(-1)} != {w1.size(1)}"
+            )
+        elif self.quant_config.use_int4_w4a16:
             assert hidden_states.size(-1) // 2 == w1.size(2), "Hidden size mismatch"
         else:
             assert hidden_states.size(-1) == w1.size(2), (
