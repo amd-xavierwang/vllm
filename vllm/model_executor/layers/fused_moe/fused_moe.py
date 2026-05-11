@@ -1022,6 +1022,39 @@ def dispatch_fused_moe_kernel(
             bit=4 if use_int4_w4a16 else 8,
         )
 
+        if use_int4_w4a16 and B.dtype == torch.int32:
+            shuffle_config = config.copy()
+            if "BLOCK_SIZE_N" not in shuffle_config:
+                shuffle_config.update(
+                    get_moe_wna16_block_config(
+                        config=shuffle_config,
+                        use_moe_wna16_cuda=False,
+                        num_valid_tokens=num_tokens,
+                        size_k=A.size(1),
+                        size_n=B.size(1),
+                        num_experts=B.size(0),
+                        group_size=block_shape[1],
+                        real_top_k=top_k,
+                        block_size_m=shuffle_config["BLOCK_SIZE_M"],
+                    )
+                )
+            invoke_fused_moe_kernel_hybrid_triton(
+                A,
+                B,
+                C,
+                B_scale,
+                topk_weights,
+                sorted_token_ids,
+                expert_ids,
+                num_tokens_post_padded,
+                mul_routed_weight,
+                top_k,
+                shuffle_config,
+                compute_type,
+                block_shape[1],
+            )
+            return
+
         if use_moe_wna16_cuda:
             invoke_fused_moe_wna16_cuda_kernel(
                 A,
@@ -1865,7 +1898,11 @@ def fused_experts_impl(
     activation_enum = MoEActivation.from_str(activation)
 
     # Check constraints.
-    if use_int4_w4a16:
+    _shuffle_w4a16 = (use_int4_w4a16 and w1.dtype == torch.int32)
+    if _shuffle_w4a16:
+        # Shuffle-packed: w1 is [E, N, K//8] int32
+        assert hidden_states.size(1) // 8 == w1.size(2), "Hidden size mismatch"
+    elif use_int4_w4a16:
         assert hidden_states.size(1) // 2 == w1.size(2), "Hidden size mismatch"
     else:
         assert hidden_states.size(1) == w1.size(2), (
@@ -1902,10 +1939,19 @@ def fused_experts_impl(
         ocp_mx_scheme=None,
     )
 
+    if _shuffle_w4a16:
+        # Fake shapes back to [E, N, K//2] so try_get_optimal_moe_config
+        # extracts the correct N via its `N = w2_shape[2] * 2` logic.
+        w1_shape_for_config = (E, N, K // 2)
+        w2_shape_for_config = (E, K, N // 2)
+    else:
+        w1_shape_for_config = w1.size()
+        w2_shape_for_config = w2.size()
+
     get_config_func = functools.partial(
         try_get_optimal_moe_config,
-        w1.size(),
-        w2.size(),
+        w1_shape_for_config,
+        w2_shape_for_config,
         top_k_num,
         config_dtype,
         block_shape=block_shape,

@@ -342,6 +342,35 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 layer.register_parameter(key, param)
                 set_weight_attrs(param, extra_weight_attrs)
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if not (current_platform.is_rocm()
+                and self.quant_config.weight_bits == 4):
+            return
+
+        from vllm.model_executor.kernels.linear.mixed_precision.hybrid_w4a16 import (
+            pack_int4_exllama_shuffle,
+        )
+
+        def repack_awq_to_shuffle(w_uint8: torch.Tensor) -> torch.Tensor:
+            """Repack [E, N, K//2] uint8 -> [E, N, K//8] int32 ExLlama shuffle."""
+            E_dim, N_dim, K_half = w_uint8.shape
+            lo = (w_uint8 & 0xF).to(torch.uint8)
+            hi = ((w_uint8 >> 4) & 0xF).to(torch.uint8)
+            unpacked = torch.stack([lo, hi], dim=-1).reshape(E_dim, N_dim, K_half * 2)
+            experts = []
+            for e in range(E_dim):
+                experts.append(pack_int4_exllama_shuffle(unpacked[e]))
+            return torch.stack(experts)
+
+        layer.w13_qweight = torch.nn.Parameter(
+            repack_awq_to_shuffle(layer.w13_qweight.data),
+            requires_grad=False,
+        )
+        layer.w2_qweight = torch.nn.Parameter(
+            repack_awq_to_shuffle(layer.w2_qweight.data),
+            requires_grad=False,
+        )
+
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
     ) -> FusedMoEQuantConfig | None:

@@ -42,19 +42,24 @@ __device__ __forceinline__ void atomicAdd_half2(half2* address, half2 val) {
 }
 
 //
-
-#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700) || \
-    (defined(USE_ROCM) && HIP_VERSION < 71300000)
+#if defined(USE_ROCM)
 __device__ __forceinline__ void atomicAdd(half* address, half val) {
   atomicAdd_half(address, val);
 }
-#endif
-
-#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 600) || \
-    (defined(USE_ROCM) && HIP_VERSION < 71300000)
 __device__ __forceinline__ void atomicAdd(half2* address, half2 val) {
   atomicAdd_half2(address, val);
 }
+#elif defined(__CUDA_ARCH__)
+  #if __CUDA_ARCH__ < 700
+__device__ __forceinline__ void atomicAdd(half* address, half val) {
+  atomicAdd_half(address, val);
+}
+  #endif
+  #if __CUDA_ARCH__ < 600
+__device__ __forceinline__ void atomicAdd(half2* address, half2 val) {
+  atomicAdd_half2(address, val);
+}
+  #endif
 #endif
 
 }  // namespace gptq
