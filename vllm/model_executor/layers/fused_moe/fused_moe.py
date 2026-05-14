@@ -118,8 +118,9 @@ def fused_moe_kernel_gptq_awq_interleave(
     """
     ROCm-optimized MoE int4 kernel using tl.interleave for weight unpacking.
 
-    Expects N-packed int32 weights [E, K, N//8] with GPTQ sequential packing,
-    scales [E, K//group_size, N], and qzeros [E, K//group_size, N//8] int32.
+    Expects K-packed int32 weights [E, N, K//8] with ExLlama shuffle packing,
+    scales [E, N, K//group_size]. Supports both symmetric (bias=8) and
+    asymmetric (per-group float zero points [E, N, K//group_size]).
     """
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
@@ -165,33 +166,40 @@ def fused_moe_kernel_gptq_awq_interleave(
         + offs_k[None, :] * stride_ak
     )
 
-    # B layout: [E, K, N//8] int32 — N-packed, 8 int4 per int32
-    offs_bn_packed = (
-        pid_n * (BLOCK_SIZE_N // 8)
-        + tl.arange(0, BLOCK_SIZE_N // 8).to(tl.int64)
-    )
+    # B layout: [E, N, K//8] int32 — K-packed, ExLlama shuffle
+    offs_k8 = tl.arange(0, BLOCK_SIZE_K // 8).to(tl.int64)
     b_ptrs = (
         b_ptr
         + off_experts * stride_be
-        + offs_k[:, None] * stride_bk
-        + offs_bn_packed[None, :] * stride_bn
+        + offs_bn[:, None] * stride_bn
+        + offs_k8[None, :] * stride_bk
     )
 
-    # Precompute GPTQ sequential shifts: [0,4,8,...,28] tiled to BLOCK_N
-    shifts_row = tl.arange(0, 8) * 4
-    shifts_1d_2d = tl.broadcast_to(
-        shifts_row[None, :], (BLOCK_SIZE_N // 8, 8)
+    # ExLlama unshuffle shifts: shift[j] = (j//2)*4 + (j%2)*16
+    _exl_shifts_row = (tl.arange(0, 8) // 2) * 4 + (tl.arange(0, 8) % 2) * 16
+    _exl_shifts_1d = tl.reshape(
+        tl.broadcast_to(_exl_shifts_row[None, :], (BLOCK_SIZE_K // 8, 8)),
+        (BLOCK_SIZE_K,),
     )
-    shifts_1d = tl.reshape(shifts_1d_2d, (BLOCK_SIZE_N,))
-    shifts = tl.broadcast_to(shifts_1d[None, :], (BLOCK_SIZE_K, BLOCK_SIZE_N))
+    exl_shifts = tl.broadcast_to(
+        _exl_shifts_1d[None, :], (BLOCK_SIZE_N, BLOCK_SIZE_K)
+    )
 
     if not has_zp:
         b_zp_num = 8
-    elif has_zp:
-        # Zeros are [E, K_groups, N//8] int32, same interleave pattern
-        zp_shifts_1d = shifts_1d
+    else:
+        # ZP: [E, K_groups, N//8] int32 — N-packed, GPTQ sequential shifts
+        offs_bn_packed_zp = (
+            pid_n * (BLOCK_SIZE_N // 8)
+            + tl.arange(0, BLOCK_SIZE_N // 8).to(tl.int64)
+        )
+        zp_shifts_row = tl.arange(0, 8) * 4
+        zp_shifts_1d = tl.reshape(
+            tl.broadcast_to(zp_shifts_row[None, :], (BLOCK_SIZE_N // 8, 8)),
+            (BLOCK_SIZE_N,),
+        )
 
-    # Scale offsets: scales are [E, K_groups, N] after repacking
+    # Scale offsets: scales are [E, N, K//G] (original layout, no transpose)
     offs_sn = (
         pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
     ) % N
@@ -212,49 +220,48 @@ def fused_moe_kernel_gptq_awq_interleave(
             other=0.0,
         )
 
-        # Load packed weights [BLOCK_K, BLOCK_N//8] int32
+        # Load packed weights [BLOCK_N, BLOCK_K//8] int32
         b_packed = tl.load(b_ptrs)
-        # Unpack via 3x interleave → [BLOCK_K, BLOCK_N]
+        # Unpack via 3x interleave → [BLOCK_N, BLOCK_K]
         b = tl.interleave(b_packed, b_packed)
         b = tl.interleave(b, b)
         b = tl.interleave(b, b)
-        b = (b >> shifts) & 0xF
+        b_nk = (b >> exl_shifts) & 0xF
 
-        # Scales: [E, K_groups, N] — load [BLOCK_K, BLOCK_N]
-        g_idx = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
+        # Scales: [E, N, K//G] — load 1D [BLOCK_N], broadcast
+        g_idx = (k * BLOCK_SIZE_K) // group_size
         b_scale_ptrs = (
             b_scale_ptr
             + off_experts * stride_bse
+            + offs_sn * stride_bsn
             + g_idx * stride_bsk
-            + offs_sn[None, :] * stride_bsn
         )
-        b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
-        b_scale = b_scale.to(tl.float32)
+        b_scale = tl.load(b_scale_ptrs).to(tl.float32)
 
         if has_zp:
-            # Zeros: [E, K_groups, N//8] int32
-            g_idx_zp = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
+            # ZP: [E, K_groups, N//8] int32 — load 1D [N//8], interleave
             b_zp_ptrs = (
                 b_zp_ptr
                 + off_experts * stride_bze
-                + g_idx_zp * stride_bzk
-                + offs_bn_packed[None, :] * stride_bzn
+                + g_idx * stride_bzk
+                + offs_bn_packed_zp * stride_bzn
             )
-            b_zp_packed = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
+            b_zp_packed = tl.load(b_zp_ptrs)
             b_zp = tl.interleave(b_zp_packed, b_zp_packed)
             b_zp = tl.interleave(b_zp, b_zp)
             b_zp = tl.interleave(b_zp, b_zp)
-            b_zp = (b_zp >> shifts) & 0xF
-            b_zp = b_zp.to(tl.float32)
-
-        if has_zp:
-            b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
+            b_zp = (b_zp >> zp_shifts_1d) & 0xF
+            b_dq = (b_nk.to(tl.float32) - b_zp.to(tl.float32)[:, None]) * b_scale[:, None]
         else:
-            b = ((b.to(tl.float32) - b_zp_num) * b_scale).to(compute_type)
+            b_dq = (b_nk.to(tl.float32) - b_zp_num) * b_scale[:, None]
+
+        # Transpose to [BLOCK_K, BLOCK_N] for tl.dot(a, b)
+        b = tl.trans(b_dq).to(compute_type)
+
         accumulator = tl.dot(a, b, acc=accumulator)
 
         a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
+        b_ptrs += (BLOCK_SIZE_K // 8) * stride_bk
 
     if MUL_ROUTED_WEIGHT:
         moe_weight = tl.load(
@@ -854,7 +861,7 @@ def invoke_fused_moe_wna16_triton_kernel(
     M = A.size(0)
     num_tokens = M * top_k
 
-    # After ROCm int4 repacking: B is [E, K, N//8] int32, scales [E, K_g, N]
+    # After ROCm int4 repacking: B is [E, N, K//8] int32, scales [E, N, K//G]
     use_interleave = (
         current_platform.is_rocm()
         and use_int4_w4a16
@@ -862,7 +869,7 @@ def invoke_fused_moe_wna16_triton_kernel(
     )
 
     if use_interleave:
-        N_out = B_scale.size(2)
+        N_out = B.size(1)
     else:
         N_out = B.size(1)
 
@@ -875,9 +882,13 @@ def invoke_fused_moe_wna16_triton_kernel(
     )
     config = config.copy()
     if use_interleave:
-        # Interleave kernel needs BLOCK_N to be power-of-2 multiple of 8,
-        # and performs best at BLOCK_N=64 with BLOCK_K=32 on RDNA3.
-        config.update({"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32})
+        group_size = block_shape[1]
+        K = A.size(1)
+        BLOCK_SIZE_K = min(group_size, 32, K)
+        BLOCK_SIZE_K = max(BLOCK_SIZE_K, 8)
+        assert BLOCK_SIZE_K % 8 == 0, f"BLOCK_SIZE_K={BLOCK_SIZE_K} not multiple of 8"
+        assert K % BLOCK_SIZE_K == 0, f"K={K} not divisible by BLOCK_SIZE_K={BLOCK_SIZE_K}"
+        config.update({"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": BLOCK_SIZE_K})
     else:
         config.update(
             get_moe_wna16_block_config(
@@ -894,15 +905,16 @@ def invoke_fused_moe_wna16_triton_kernel(
         )
 
     if use_interleave:
-        # B: [E, K, N//8] int32 — stride(0)=expert, stride(1)=K, stride(2)=N_packed
-        # B_scale: [E, K_groups, N] — stride(0)=expert, stride(1)=K_groups, stride(2)=N
-        # B_zp: [E, K_groups, N//8] int32 — same as B for packed dim
+        # B: [E, N, K//8] int32 — stride(0)=expert, stride(1)=N, stride(2)=K_packed
+        # B_scale: [E, N, K//G] — stride(0)=expert, stride(1)=N, stride(2)=K_groups
+        # B_zp: [E, K_groups, N//8] int32 (when has_zp) — N-packed
+        has_zp = B_zp is not None
         fused_moe_kernel_gptq_awq_interleave[grid](
             A,
             B,
             C,
             B_scale,
-            B_zp if B_zp is not None else B,
+            B_zp if has_zp else B,
             topk_weights,
             sorted_token_ids,
             expert_ids,
@@ -913,23 +925,23 @@ def invoke_fused_moe_wna16_triton_kernel(
             num_tokens,
             A.stride(0),
             A.stride(1),
-            B.stride(0),
-            B.stride(1),
-            B.stride(2),
+            B.stride(0),   # stride_be (expert)
+            B.stride(2),   # stride_bk (K//8, contiguous)
+            B.stride(1),   # stride_bn (N)
             C.stride(1),
             C.stride(2),
-            B_scale.stride(0),
-            B_scale.stride(1),
-            B_scale.stride(2),
-            B_zp.stride(0) if B_zp is not None else 0,
-            B_zp.stride(1) if B_zp is not None else 0,
-            B_zp.stride(2) if B_zp is not None else 0,
+            B_scale.stride(0),  # stride_bse
+            B_scale.stride(2),  # stride_bsk (K//G dim)
+            B_scale.stride(1),  # stride_bsn (N dim)
+            B_zp.stride(0) if has_zp else 0,  # stride_bze
+            B_zp.stride(1) if has_zp else 0,  # stride_bzk (K_groups dim)
+            B_zp.stride(2) if has_zp else 0,  # stride_bzn (N//8 dim)
             block_k_diviable=A.size(1) % config["BLOCK_SIZE_K"] == 0,
             group_size=block_shape[1],
             MUL_ROUTED_WEIGHT=mul_routed_weight,
             top_k=top_k,
             compute_type=compute_type,
-            has_zp=B_zp is not None,
+            has_zp=has_zp,
             **config,
         )
     else:
@@ -1971,11 +1983,11 @@ def fused_experts_impl(
     activation_enum = MoEActivation.from_str(activation)
 
     # Check constraints.
-    # Detect ROCm int4 interleave layout: w1 is [E, K, N//8] int32
+    # Detect ROCm int4 interleave layout: w1 is [E, N, K//8] int32
     _rocm_interleave = (use_int4_w4a16 and w1.dtype == torch.int32)
     if _rocm_interleave:
-        assert hidden_states.size(1) == w1.size(1), (
-            f"Hidden size mismatch {hidden_states.size(1)} != {w1.size(1)}"
+        assert hidden_states.size(1) == w1.size(2) * 8, (
+            f"Hidden size mismatch {hidden_states.size(1)} != {w1.size(2) * 8}"
         )
     elif use_int4_w4a16:
         assert hidden_states.size(1) // 2 == w1.size(2), "Hidden size mismatch"
@@ -1993,8 +2005,8 @@ def fused_experts_impl(
     num_tokens = hidden_states.size(0)
     if _rocm_interleave:
         E = w1.size(0)
-        N = w1_scale.size(2) if w1_scale is not None else w1.size(2) * 8
-        K = w1.size(1)
+        N = w1.size(1)
+        K = hidden_states.size(1)
     else:
         E, N, _ = w1.size()
         K = w2.size(1)

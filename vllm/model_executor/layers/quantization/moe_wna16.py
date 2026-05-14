@@ -371,23 +371,29 @@ class MoeWNA16Method(FusedMoEMethodBase):
             return
 
         def _repack_int4_to_int32(w: torch.Tensor) -> torch.Tensor:
-            """Repack [E, N, K//2] uint8 → [E, K, N//8] int32.
+            """Repack [E, N, K//2] uint8 → [E, N, K//8] int32.
 
             Input: K-packed uint8 (2 int4 per byte, low nibble first).
-            Output: N-packed int32 (8 int4 per int32, GPTQ sequential shifts
-                    [0,4,...,28]).
+            Output: K-packed int32 (8 int4 per int32, ExLlama shuffle
+                    order [0,2,4,6,1,3,5,7]).
             """
             E, N, K_half = w.shape
             K = K_half * 2
             lo = (w & 0xF).to(torch.int32)
             hi = ((w >> 4) & 0xF).to(torch.int32)
             unpacked = torch.stack([lo, hi], dim=-1).reshape(E, N, K)
-            transposed = unpacked.permute(0, 2, 1).contiguous()
-            N8 = N // 8
-            shifts = torch.arange(8, device=w.device, dtype=torch.int32) * 4
+            K8 = K // 8
+            g = unpacked.view(E, N, K8, 8)
             packed = (
-                transposed.view(E, K, N8, 8) << shifts
-            ).sum(dim=-1, dtype=torch.int32)
+                g[..., 0]
+                | (g[..., 2] << 4)
+                | (g[..., 4] << 8)
+                | (g[..., 6] << 12)
+                | (g[..., 1] << 16)
+                | (g[..., 3] << 20)
+                | (g[..., 5] << 24)
+                | (g[..., 7] << 28)
+            )
             return packed.contiguous()
 
         def _repack_zp_int4_to_int32(zp: torch.Tensor) -> torch.Tensor:
@@ -410,14 +416,6 @@ class MoeWNA16Method(FusedMoEMethodBase):
             new_data = _repack_int4_to_int32(old.data)
             layer.register_parameter(
                 qw_name,
-                torch.nn.Parameter(new_data, requires_grad=False),
-            )
-
-        for sc_name in ("w13_scales", "w2_scales"):
-            old = getattr(layer, sc_name)
-            new_data = old.data.permute(0, 2, 1).contiguous()
-            layer.register_parameter(
-                sc_name,
                 torch.nn.Parameter(new_data, requires_grad=False),
             )
 
