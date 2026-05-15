@@ -370,17 +370,6 @@ class MoeWNA16Method(FusedMoEMethodBase):
         ):
             return
 
-        w13_N = layer.w13_qweight.data.shape[1]
-        w2_N = layer.w2_qweight.data.shape[1]
-        if w13_N % 8 != 0 or w2_N % 8 != 0:
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.warning(
-                "Skipping ROCm int4 interleave repacking: N dimensions "
-                "must be divisible by 8 (w13 N=%d, w2 N=%d). "
-                "Falling back to default kernel.", w13_N, w2_N)
-            return
-
         def _repack_int4_to_int32(w: torch.Tensor) -> torch.Tensor:
             """Repack [E, N, K//2] uint8 → [E, K, N//8] int32.
 
@@ -416,32 +405,42 @@ class MoeWNA16Method(FusedMoEMethodBase):
             ).sum(dim=-1, dtype=torch.int32)
             return packed.contiguous()
 
-        for qw_name in ("w13_qweight", "w2_qweight"):
-            old = getattr(layer, qw_name)
-            new_data = _repack_int4_to_int32(old.data)
+        for qw_name, sc_name, zp_name in (
+            ("w13_qweight", "w13_scales", "w13_qzeros"),
+            ("w2_qweight", "w2_scales", "w2_qzeros"),
+        ):
+            qw = getattr(layer, qw_name)
+            N = qw.data.shape[1]
+            if N % 8 != 0:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(
+                    "Skipping ROCm int4 interleave repacking for %s: "
+                    "N=%d not divisible by 8. Using default kernel.",
+                    qw_name, N)
+                continue
+
             layer.register_parameter(
                 qw_name,
-                torch.nn.Parameter(new_data, requires_grad=False),
+                torch.nn.Parameter(
+                    _repack_int4_to_int32(qw.data), requires_grad=False),
             )
 
-        for sc_name in ("w13_scales", "w2_scales"):
-            old = getattr(layer, sc_name)
-            new_data = old.data.permute(0, 2, 1).contiguous()
+            sc = getattr(layer, sc_name)
             layer.register_parameter(
                 sc_name,
-                torch.nn.Parameter(new_data, requires_grad=False),
+                torch.nn.Parameter(
+                    sc.data.permute(0, 2, 1).contiguous(), requires_grad=False),
             )
 
-        if self.quant_config.has_zp:
-            for zp_name in ("w13_qzeros", "w2_qzeros"):
-                old = getattr(layer, zp_name)
-                new_data = _repack_zp_int4_to_int32(old.data)
+            if self.quant_config.has_zp:
+                zp = getattr(layer, zp_name)
                 layer.register_parameter(
                     zp_name,
-                    torch.nn.Parameter(new_data, requires_grad=False),
+                    torch.nn.Parameter(
+                        _repack_zp_int4_to_int32(zp.data),
+                        requires_grad=False),
                 )
-
-        layer._rocm_int4_interleave = True
 
     def apply(
         self,
