@@ -1,0 +1,42 @@
+======================================================================
+MoE int4 End-to-End Benchmark: Interleave vs ExLlama vs Main
+GPU: AMD Radeon Pro W7900 Dual Slot (gfx1100)
+Date: 2026-05-15
+Dataset: ShareGPT, 1000 prompts
+Benchmark: vllm bench throughput --dtype auto --max-model-len 4096
+           --gpu-memory-utilization 0.8
+======================================================================
+
+=== Qwen3.6-35B-A3B-AWQ (Qwen/Qwen3-0.6B-A0.3B-Instruct-AWQ) ===
+Model: E=256, hidden=2048, inter=512, top_k=8, G=128
+
+Branch                  req/s    tok/s    Speedup vs Main
+------                  -----    -----    ---------------
+main (upstream)         1.20       -      1.00x
+interleave (N-packed)   2.58       -      2.15x
+exllama (K-packed)      2.25       -      1.88x
+
+Interleave vs ExLlama: 1.15x faster (interleave wins)
+
+=== Qwen3-30B-A3B-AWQ ===
+Model: E=128, hidden=2048, inter=768, top_k=8, G=128
+
+Branch                  req/s    tok/s    Speedup vs Main
+------                  -----    -----    ---------------
+main (upstream)         2.14      897.83  1.00x
+interleave (N-packed)   6.11     2562.38  2.86x
+exllama (K-packed)      5.43     2275.94  2.54x
+
+Interleave vs ExLlama: 1.13x faster (interleave wins)
+
+=== Qwen3-30B-A3B-AWQ, Single-Sequence Decode (max_num_seqs=1) ===
+Benchmark: vllm serve + vllm bench serve, ShareGPT 80 prompts
+
+Metric              Interleave    ExLlama     Ratio (Int/Ex)
+------              ----------    -------     --------------
+req/s               0.26          0.23        1.13x
+Output tok/s        53.69         47.31       1.13x
+Total tok/s         118.72        103.56      1.15x
+Mean TPOT (ms)      17.40         19.97       0.87x (lower=better)
+Mean ITL (ms)       17.93         20.59       0.87x
+P99 ITL (ms)        18.99         21.44       0.89x

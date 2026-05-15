@@ -370,6 +370,17 @@ class MoeWNA16Method(FusedMoEMethodBase):
         ):
             return
 
+        w13_N = layer.w13_qweight.data.shape[1]
+        w2_N = layer.w2_qweight.data.shape[1]
+        if w13_N % 8 != 0 or w2_N % 8 != 0:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                "Skipping ROCm int4 interleave repacking: N dimensions "
+                "must be divisible by 8 (w13 N=%d, w2 N=%d). "
+                "Falling back to default kernel.", w13_N, w2_N)
+            return
+
         def _repack_int4_to_int32(w: torch.Tensor) -> torch.Tensor:
             """Repack [E, N, K//2] uint8 → [E, K, N//8] int32.
 
