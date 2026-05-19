@@ -874,24 +874,19 @@ def invoke_fused_moe_wna16_triton_kernel(
         * triton.cdiv(N_out, META["BLOCK_SIZE_N"]),
     )
     config = config.copy()
-    if use_interleave:
-        # Interleave kernel needs BLOCK_N to be power-of-2 multiple of 8,
-        # and performs best at BLOCK_N=64 with BLOCK_K=32 on RDNA3.
-        config.update({"BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32})
-    else:
-        config.update(
-            get_moe_wna16_block_config(
-                config=config,
-                use_moe_wna16_cuda=False,
-                num_valid_tokens=num_tokens,
-                size_k=A.size(1),
-                size_n=N_out,
-                num_experts=B.size(0),
-                group_size=block_shape[1],
-                real_top_k=top_k,
-                block_size_m=config["BLOCK_SIZE_M"],
-            )
+    config.update(
+        get_moe_wna16_block_config(
+            config=config,
+            use_moe_wna16_cuda=False,
+            num_valid_tokens=num_tokens,
+            size_k=A.size(1),
+            size_n=N_out,
+            num_experts=B.size(0),
+            group_size=block_shape[1],
+            real_top_k=top_k,
+            block_size_m=config["BLOCK_SIZE_M"],
         )
+    )
 
     if use_interleave:
         # B: [E, K, N//8] int32 — stride(0)=expert, stride(1)=K, stride(2)=N_packed
