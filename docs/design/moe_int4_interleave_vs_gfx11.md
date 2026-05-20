@@ -163,7 +163,75 @@ and `has_zp=False` (hardcoded symmetric).
 Both achieve similar kernel-level speedup (~1.55-1.6x) on Qwen3-30B-A3B-AWQ
 shapes (E=128, N=384, K=2048) on gfx1100 (AMD Radeon Pro W7900).
 
-End-to-end throughput benchmark on the interleave branch showed 2.95x improvement
-(2.16 → 6.38 req/s) on Qwen3-30B-A3B-AWQ with 1000 ShareGPT prompts. The gfx11
-branch could not be benchmarked end-to-end due to build/startup issues unrelated
-to the kernel.
+### ATT (Advanced Thread Trace) per-instruction analysis
+
+Collected with `rocprofv3 --att` on gfx1100, decoded with `att-tool`.
+Shape: Qwen3-30B-A3B-AWQ MoE layer (E=128, N=1536, K=2048, group_size=128, top_k=8).
+Latency is summed per opcode category, normalized by max hitcount to give per-wave cycles.
+
+```
+                      ExLlama M=128   Interleave M=128   ExLlama M=4096   Interleave M=4096
+                      Lat/wave    %    Lat/wave    %      Lat/wave    %    Lat/wave    %
+  ─────────────────────────────────────────────────────────────────────────────────────────
+  WAITCNT             47,204  67.4%    10,596  81.7%       1,343  48.9%     1,002  28.2%
+  BARRIER             22,506  32.1%     1,142   8.8%         365  13.3%       634  17.9%
+  BPERMUTE               100   0.1%         0   0.0%         542  19.7%         0   0.0%
+  LDS                     28   0.0%       990   7.6%         160   5.8%     1,690  47.6%
+  VALU                   105   0.1%       187   1.4%         306  11.1%       197   5.5%
+  WMMA                     2   0.0%         2   0.0%           3   0.1%         2   0.1%
+  ─────────────────────────────────────────────────────────────────────────────────────────
+  TOTAL               70,059   100%    12,964   100%       2,746   100%     3,548   100%
+
+  Per-wave ratio:     ExLlama/Interleave = 5.4x              ExLlama/Interleave = 0.77x
+  Wall-clock:         2.195ms vs 1.627ms (IL wins)            6.836ms vs 7.811ms (EX wins)
+```
+
+**Key observations:**
+- WMMA (compute) is <0.1% at all M — both kernels are memory/sync-bound.
+- At M=128 (small prefill/decode), ExLlama spends 32% in `s_barrier` (from `tl.trans()` LDS transpose requiring workgroup sync). Interleave avoids barriers for unpacking entirely.
+- At M=4096 (large prefill), Interleave spends 48% in LDS ops (`tl.interleave` compiles to 286 DS read/write ops). ExLlama's `ds_bpermute` (cross-lane shuffle) rises to 20%.
+- `s_waitcnt` = single-wave stall waiting on its own VMEM loads. `s_barrier` = workgroup sync (__syncthreads equivalent).
+
+**ATT collection commands:**
+```bash
+SKIP_OCCUPANCY=1 rocprofv3 --att \
+  python3 /tmp/att_interleave_runner.py 128   # or att_exllama_runner.py
+
+# Decode binary ATT trace:
+att-tool -i <att_dir>/<trace>.att -o output.csv --csv
+```
+
+### End-to-end benchmark: Interleave vs ExLlama
+
+Model: Qwen3-30B-A3B-AWQ, dataset: ShareGPT (500 prompts), gfx1100 (W7900).
+
+```bash
+# Server
+vllm serve /mnt/nas_share/models/Qwen/Qwen3-30B-A3B-AWQ \
+  --max-model-len 4096 --gpu-memory-utilization 0.95 --port 8000
+
+# Benchmark
+vllm bench serve \
+  --model /mnt/nas_share/models/Qwen/Qwen3-30B-A3B-AWQ \
+  --dataset-name sharegpt \
+  --dataset-path /mnt/nas_share/datasets/sharegpt/ShareGPT_V3_unfiltered_cleaned_split.json \
+  --num-prompts 500
+```
+
+| Metric | Interleave (GPTQ) | ExLlama Shuffle | Winner |
+|---|---|---|---|
+| Duration (s) | 94.88 | 102.44 | Interleave (+8%) |
+| Request throughput (req/s) | 5.27 | 4.88 | Interleave (+8%) |
+| Output token throughput (tok/s) | 1158.13 | 1071.57 | Interleave (+8%) |
+| Total token throughput (tok/s) | 2248.28 | 2081.29 | Interleave (+8%) |
+| Mean TTFT (ms) | 22726 | 15875 | ExLlama (-30%) |
+| Median TTFT (ms) | 18972 | 11722 | ExLlama (-38%) |
+| Mean TPOT (ms) | 183.97 | 188.03 | Interleave (-2%) |
+| Median TPOT (ms) | 149.36 | 158.54 | Interleave (-6%) |
+| Mean ITL (ms) | 129.24 | 141.49 | Interleave (-9%) |
+| Median ITL (ms) | 110.95 | 126.62 | Interleave (-12%) |
+
+Interleave wins overall throughput (+8%) and decode latency (TPOT/ITL).
+ExLlama wins TTFT (prefill) by 30-38%, consistent with the ATT M=4096 result
+where ExLlama has lower per-wave latency. The decode advantage of Interleave
+accumulates over longer generations, yielding higher total throughput.
