@@ -247,6 +247,46 @@ ExLlama wins TTFT (prefill) by 30-38%, consistent with the ATT M=4096 result
 where ExLlama has lower per-wave latency. The decode advantage of Interleave
 accumulates over longer generations, yielding higher total throughput.
 
+### End-to-end benchmark: Interleave vs Main (AWQ, batched serve)
+
+Model: Qwen3-30B-A3B-AWQ (MoeWNA16Method), dataset: ShareGPT (500 prompts),
+gfx1100 (W7900). AWQ auto-detects fp16; bf16 forced with `--dtype bfloat16`.
+
+```bash
+# Server (fp16 — AWQ default)
+vllm serve /mnt/nas_share/models/Qwen/Qwen3-30B-A3B-AWQ \
+  --max-model-len 4096 --gpu-memory-utilization 0.90 --port 8000
+
+# Server (bf16 — forced)
+vllm serve /mnt/nas_share/models/Qwen/Qwen3-30B-A3B-AWQ \
+  --max-model-len 4096 --gpu-memory-utilization 0.90 --port 8000 --dtype bfloat16
+
+# Benchmark
+vllm bench serve \
+  --model /mnt/nas_share/models/Qwen/Qwen3-30B-A3B-AWQ \
+  --dataset-name sharegpt \
+  --dataset-path /mnt/nas_share/datasets/sharegpt/ShareGPT_V3_unfiltered_cleaned_split.json \
+  --num-prompts 500
+```
+
+| Metric | Interleave fp16 | Main fp16 | Main bf16 |
+| --- | --- | --- | --- |
+| Duration (s) | 116.71 | 283.17 | 133.00 |
+| Request throughput (req/s) | 4.28 | 1.77 | 3.76 |
+| Output tok/s | 941.53 | 388.06 | 826.21 |
+| Total tok/s | 1827.79 | 753.34 | 1603.93 |
+| Mean TTFT (ms) | 22570 | 44674 | 24875 |
+| Median TTFT (ms) | 18648 | 34158 | 20628 |
+| Mean TPOT (ms) | 194.39 | 510.52 | 216.30 |
+| Median TPOT (ms) | 158.49 | 440.30 | 176.74 |
+| Mean ITL (ms) | 147.53 | 407.63 | 164.87 |
+| Median ITL (ms) | 127.68 | 377.48 | 142.66 |
+
+Main fp16 is **2.13x slower** than main bf16 (388 vs 826 tok/s) due to register
+spilling (see VGPR analysis below). Interleave fp16 eliminates the spilling
+penalty entirely, achieving **+14% over main bf16** (942 vs 826 tok/s) and
+**+143% over main fp16** (942 vs 388 tok/s).
+
 ### End-to-end benchmark: Interleave vs Main (compressed-tensors)
 
 Model: RedHatAI/Qwen3-30B-A3B-quantized.w4a16 (CompressedTensorsWNA16MoEMethod),
@@ -299,16 +339,20 @@ vllm bench serve \
 The interleave branch delivers **+12% throughput** and **~5% decode latency
 reduction** on the compressed-tensors model. TTFT is equivalent.
 
-### End-to-end decode latency: Interleave vs Main (AWQ, single-batch)
+### End-to-end decode latency: Interleave vs Main (AWQ, single-batch, fp16 vs bf16)
 
 Model: Qwen3-30B-A3B-AWQ (MoeWNA16Method), dataset: ShareGPT (100 prompts),
 gfx1100 (W7900). `max-num-seqs=1` isolates pure decode latency
 (memory-bandwidth-bound), removing batching/scheduling noise.
 
 ```bash
-# Server
+# Server (fp16 — AWQ default)
 vllm serve /mnt/nas_share/models/Qwen/Qwen3-30B-A3B-AWQ \
   --max-model-len 4096 --gpu-memory-utilization 0.90 --max-num-seqs 1
+
+# Server (bf16 — forced)
+vllm serve /mnt/nas_share/models/Qwen/Qwen3-30B-A3B-AWQ \
+  --max-model-len 4096 --gpu-memory-utilization 0.90 --max-num-seqs 1 --dtype bfloat16
 
 # Benchmark
 vllm bench serve \
@@ -318,26 +362,28 @@ vllm bench serve \
   --num-prompts 100
 ```
 
-| Metric | Interleave | Main | Delta |
-| --- | --- | --- | --- |
-| Mean TPOT (ms) | 17.87 | 23.63 | **-24.4%** |
-| Median TPOT (ms) | 17.95 | 24.14 | **-25.6%** |
-| Mean ITL (ms) | 17.87 | 23.58 | **-24.2%** |
-| Median ITL (ms) | 17.89 | 24.09 | **-25.7%** |
-| Output tok/s | 54.22 | 40.19 | **+34.9%** |
-| Mean TTFT (s) | 195.1 | 261.2 | **-25.3%** |
-| Median TTFT (s) | 194.3 | 256.2 | **-24.2%** |
+| Metric | Interleave fp16 | Interleave bf16 | Main fp16 | Main bf16 |
+| --- | --- | --- | --- | --- |
+| Output tok/s | **54.22** | 51.64 | 40.19 | 50.15 |
+| Mean TPOT (ms) | **17.87** | 18.73 | 23.63 | 19.22 |
+| Median TPOT (ms) | **17.95** | 18.82 | 24.14 | 19.31 |
+| Mean ITL (ms) | **17.87** | 18.73 | 23.58 | 19.24 |
+| Median ITL (ms) | **17.89** | 18.77 | 24.09 | 19.26 |
+| Mean TTFT (s) | **195.1** | 208.7 | 261.2 | 213.8 |
 
 TTFT is dominated by queuing delay (`max-num-seqs=1` serializes all 100
 requests), so absolute values reflect total queue drain time rather than
-single-request prefill latency. The ~25% reduction mirrors the decode
-speedup — faster per-token generation drains the queue sooner.
+single-request prefill latency.
 
-The large decode latency improvement confirms the interleave kernel genuinely
-reduces global memory traffic — not just a Triton compilation artifact. The
-fp16 path benefits disproportionately because the original kernel compiles to
-256 VGPRs with register spilling (Scratch=184-192 bytes on gfx1100), while
-the interleave kernel avoids this.
+Key observations:
+
+- **Main fp16 → Main bf16**: 24.14 → 19.31ms (**-20%**) — purely from
+  eliminating register spilling (same kernel, different dtype compilation).
+- **Main bf16 → Interleave fp16**: 19.31 → 17.95ms (**-7%**) — pure
+  algorithmic gain from interleave unpacking, with spilling already absent.
+- **Interleave fp16 is faster than Interleave bf16** (17.95 vs 18.82ms) —
+  with spilling eliminated, fp16 has a slight edge from native WMMA support
+  on gfx1100.
 
 ### End-to-end decode latency: Interleave vs Main (compressed-tensors, single-batch)
 
@@ -362,6 +408,39 @@ algorithmic bandwidth gain from interleave unpacking is too small to measure
 at batch=1. The interleave advantage materializes at higher batch sizes
 (+12% throughput in the 500-prompt batched benchmark above) where reduced
 load instruction count becomes the bottleneck.
+
+### VGPR and register spilling analysis (gfx1100)
+
+Collected with `rocprofv3 --kernel-trace --stats` on Qwen3-30B-A3B-AWQ
+end-to-end inference. The MoE Triton kernel (`fused_moe_kernel_gptq_awq`)
+is the dominant GPU consumer.
+
+**Original kernel (main branch):**
+
+| Config | VGPR | Scratch (bytes) | Calls | Avg Latency (us) | Spilling? |
+| --- | --- | --- | --- | --- | --- |
+| FP16, Grid=408576 | 256 | 184 | 6,336 | 5,012 | **Yes** |
+| FP16, Grid=544768 | 256 | 192 | 6,336 | 2,337 | **Yes** |
+| FP16, small grid | 224 | 0 | 288 | 264 | No |
+| BF16, all grids | 240 | 0 | 12,672 | 1,114 | No |
+
+**Interleave kernel:**
+
+| Config | VGPR | Scratch (bytes) | Spilling? |
+| --- | --- | --- | --- |
+| FP16 | 96 | 0 | No |
+| BF16 | _(similar)_ | 0 | No |
+
+The FP16 original kernel needs 256 VGPRs, exceeding the gfx1100 hardware budget
+and causing 184-192 bytes of register spilling per thread to global memory
+(scratch). The BF16 compilation fits in 240 VGPRs with zero spill. The
+interleave kernel compiles to only **96 VGPRs** — a 2.7x reduction vs the
+original FP16 — eliminating spilling entirely for both dtypes.
+
+The spilling FP16 kernel calls (12,672 total) account for ~46.6s of GPU time in
+the 100-prompt single-batch benchmark, explaining the 24ms→18ms TPOT improvement.
+This is the root cause of the fp16 vs bf16 performance gap on main: same kernel
+code, different Triton compilation register pressure.
 
 ### Accuracy (lm_eval gsm8k, 5-shot, 200 samples)
 
