@@ -412,17 +412,12 @@ class TritonWNA16Experts(TritonExperts):
         w2: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> tuple[int, int, int, int, int]:
+        E, M, N, K, topk = super().moe_problem_size(a1, w1, w2, topk_ids)
         # Interleave-repacked int4: w1 is [E, K, N//8] int32, so N can't
         # be read from w1.shape[1].  Derive it from the scale tensor.
         if self.quant_config.use_int4_w4a16 and w1.dtype == torch.int32:
-            E, K, _ = w1.shape
             assert self.w1_scale is not None
             N = self.w1_scale.size(2)
-        else:
-            return super().moe_problem_size(a1, w1, w2, topk_ids)
-
-        M = a1.size(0) if a1.dim() == 2 else a1.size(1)
-        topk = topk_ids.size(1)
         return E, M, N, K, topk
 
     def apply(
