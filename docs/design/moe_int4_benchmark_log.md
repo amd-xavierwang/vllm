@@ -185,6 +185,55 @@ P99 ITL (ms):                            451.82
 
 ---
 
+## AWQ on gfx12 (gfx1201, Radeon AI PRO R9700) — 1 GPU
+
+**Date:** 2026-05-27
+**GPU:** 1x gfx1201 (AMD Radeon AI PRO R9700), `HIP_VISIBLE_DEVICES=3`
+**Model:** Qwen3-30B-A3B-AWQ (`MoeWNA16Method`)
+**Dataset:** ShareGPT 500 prompts
+**Branches:** `main` @ `819c610f9`, `moe-interleave-fp16-zeros` @ `fc07ebed5`
+**Methodology:** single run per config (cold-cache).
+
+### gfx12 Results
+
+| Metric | Main fp16 | Main bf16 | Interleave fp16 | Interleave bf16 |
+|--------|-----------|-----------|-----------------|-----------------|
+| Duration (s) | 160.33 | 125.45 | **118.39** | 123.24 |
+| Request throughput (req/s) | 3.12 | 3.99 | **4.22** | 4.06 |
+| Output tok/s | 685.37 | 875.17 | **928.21** | 891.68 |
+| Peak output tok/s | 1350.00 | 1789.00 | **1847.00** | 1789.00 |
+| Total tok/s | 1330.51 | 1699.71 | **1801.93** | 1731.01 |
+| Mean TTFT (ms) | 26898.25 | 21963.21 | 22196.30 | **21335.40** |
+| Median TTFT (ms) | 21262.72 | 17860.69 | 18092.56 | **17713.39** |
+| P99 TTFT (ms) | 69617.71 | 52885.11 | 53987.14 | **52468.33** |
+| Mean TPOT (ms) | 272.81 | 203.96 | **194.99** | 198.99 |
+| Median TPOT (ms) | 233.26 | 172.39 | **164.24** | 167.17 |
+| P99 TPOT (ms) | 546.49 | 418.21 | **392.91** | 400.96 |
+| Mean ITL (ms) | 216.53 | 160.24 | **152.66** | 155.43 |
+| Median ITL (ms) | 198.99 | 144.73 | **139.14** | 141.14 |
+| P99 ITL (ms) | 548.34 | 421.11 | **394.37** | 401.65 |
+
+### gfx12 Key Takeaways
+
+- **Main fp16 → Interleave fp16**: +35% output tok/s (685→928), −30% median TPOT (233→164ms). Same direction as gfx11 but much smaller magnitude (gfx11 was +144%).
+- **Main bf16 → Interleave bf16**: +2% output tok/s (875→892), −3% median TPOT (172→167ms). Within noise — the bf16 path was already healthy on main.
+- **Main bf16 → Interleave fp16**: +6% output tok/s (875→928), −5% median TPOT (172→164ms). Modest algorithmic gain.
+- **Interleave fp16 vs Interleave bf16**: fp16 is ~4% faster (928 vs 892 tok/s) — same direction as gfx11.
+- **TTFT**: All four configs cluster around 18–21s median; no clear winner. Interleave does NOT regress TTFT on gfx12 (unlike gfx11 where main bf16 had a clear ~5s lead).
+- **Main fp16 is not crushed on gfx12.** gfx11 main fp16 was 392 tok/s (catastrophic VGPR spilling); gfx12 main fp16 is 685 tok/s — 1.75× faster. RDNA4 likely has either more VGPRs per SIMD or different LLVM codegen that avoids the worst of the fp16 spill cliff. Confirming would require dumping AMDGCN on gfx12.
+- **After the fix, the two architectures converge.** Interleave fp16: gfx11 957 vs gfx12 928 tok/s. Interleave bf16: gfx11 897 vs gfx12 892 tok/s. Once register pressure is removed, the kernel hits similar throughput on both.
+
+### gfx11 vs gfx12 head-to-head (interleave delta)
+
+| Metric | gfx11 Δ (interleave−main) | gfx12 Δ (interleave−main) |
+|---|---|---|
+| Output tok/s (fp16) | +565 (+144%) | +243 (+35%) |
+| Median TPOT fp16 (ms) | −280 (−64%) | −69 (−30%) |
+| Output tok/s (bf16) | +34 (+4%) | +17 (+2%) |
+| Median TPOT bf16 (ms) | −15 (−8%) | −5 (−3%) |
+
+---
+
 ## Compressed-Tensors: RedHatAI/Qwen3-30B-A3B-quantized.w4a16 (bf16)
 
 **Model:** RedHatAI/Qwen3-30B-A3B-quantized.w4a16 (`CompressedTensorsWNA16MoEMethod`, symmetric int4, bf16)
@@ -269,6 +318,53 @@ Inspecting the LLIR and AMDGCN reveals the root cause is **type conversion cost 
 **fp16→f32 requires actual `v_cvt_f16_f32`/`v_cvt_f32_f16` instructions** (different exponent bias: 5-bit vs 8-bit, needs rounding). Each conversion keeps both the f32 source and fp16 result live simultaneously in VGPRs, inflating register pressure during the dequant loop. With 265 conversions (136 trunc + 129 ext) in the inner loop, fp16 pushes far past the 256 VGPR budget.
 
 The bf16 kernel does **more total ALU work** (2010 vs 1304 instructions) but uses **fewer registers** because integer shift ops can reuse registers immediately, while float conversions create additional live values. This is a Triton/LLVM compiler behavior specific to the per-element shift-and-mask unpacking path — the interleave path avoids the issue entirely by using `tl.interleave` which reduces the number of intermediate values regardless of dtype.
+
+---
+
+## VGPR and Register Spilling Analysis (gfx1201, fp16 only)
+
+**Kernel:** `fused_moe_kernel_gptq_awq` (Qwen3-30B-A3B-AWQ shape: E=128, N=768, K=2048, group_size=128)
+**Method:** Parsed every autotuned variant's `.amdgcn` from the vLLM Triton cache (`/root/.cache/vllm/torch_compile_cache/torch_aot_compile/<hash>/inductor_cache/triton/0/`) after the serve+bench runs above. BLOCK shapes inferred from the f32 accumulator tensor in each `.ttir`.
+
+### Per-variant breakdown (all 10 autotune picks per branch)
+
+**Main fp16** (`82dc452…`):
+
+| BLOCK_M | BLOCK_N | BLOCK_K | VGPRs | Scratch (B) | scratch_load / store | Occupancy |
+|---|---|---|---|---|---|---|
+| 16 | 32 | 64 | 239 | 0 | 0 / 0 | 6 |
+| 16 | 64 | 32 | 210 | 0 | 0 / 0 | 7 |
+| 16 | 64 | 32 | 210 | 0 | 0 / 0 | 7 |
+| 16 | 64 | 32 | 210 | 0 | 0 / 0 | 7 |
+| 32 | 64 | 32 | 233 | 0 | 0 / 0 | 6 |
+| 32 | 64 | 32 | 233 | 0 | 0 / 0 | 6 |
+| **64** | 64 | 32 | **256** | **68** | **8 / 8** | **5** |
+| **64** | 64 | 32 | **256** | **68** | **8 / 8** | **5** |
+| **64** | 64 | 32 | **256** | **52** | **7 / 7** | **5** |
+| **64** | 64 | 32 | **256** | **52** | **7 / 7** | **5** |
+
+**Interleave fp16** (`8b79b1a…`):
+
+| BLOCK_M | BLOCK_N | BLOCK_K | VGPRs | Scratch (B) | scratch_load / store | Occupancy |
+|---|---|---|---|---|---|---|
+| 16 | 32 | 64 | 98 | 0 | 0 / 0 | 12 |
+| 16 | 64 | 32 | 82 | 0 | 0 / 0 | 16 |
+| 16 | 64 | 32 | 82 | 0 | 0 / 0 | 16 |
+| 16 | 64 | 32 | 82 | 0 | 0 / 0 | 16 |
+| 32 | 64 | 32 | 96 | 0 | 0 / 0 | 16 |
+| 32 | 64 | 32 | 96 | 0 | 0 / 0 | 16 |
+| 64 | 64 | 32 | 102 | 0 | 0 / 0 | 12 |
+| 64 | 64 | 32 | 100 | 0 | 0 / 0 | 12 |
+| 64 | 64 | 32 | 102 | 0 | 0 / 0 | 12 |
+| 64 | 64 | 32 | 100 | 0 | 0 / 0 | 12 |
+
+### Key Observations
+
+- **Spilling is BLOCK_M-gated on gfx1201.** Main fp16 only spills at `BLOCK_M=64`, where every variant saturates at 256 VGPRs with 52–68B scratch and 7–8 scratch_load/store ops per kernel. `BLOCK_M=16/32` stay at 210–239 VGPRs with **zero scratch**.
+- **Why gfx12 main fp16 wasn't catastrophic.** Unlike gfx1100 (where the inner-loop fp16 conversions blow past the 256 budget at every tile size), gfx1201 has enough headroom that `BLOCK_M=16/32` variants fit. The autotuner mixes spilling (M=64) and non-spilling (M=16/32) picks across the workload, explaining the more modest +35% interleave gain vs gfx11's +144%.
+- **Interleave caps at ~102 VGPRs across all variants.** Max 102 (vs main's 256 saturated, 239 max-unsaturated), with **zero scratch on every variant**. Occupancy jumps from 5–7 waves (main) to 12–16 waves (interleave) — a 2–3× concurrency improvement at the SIMD level.
+- **Spill volume is smaller on gfx12 than gfx11.** gfx11 main fp16 spilled 219 VGPRs / 880B scratch at `BLOCK_M=16`; gfx12 main fp16 spills only at `BLOCK_M=64` with 52–68B scratch and ~7–8 scratch ops. Likely a combination of larger gfx1201 register file headroom per SIMD and improved RDNA4 LLVM codegen for fp16↔f32 conversions.
+- **Same root cause, different blast radius.** The per-element shift-and-mask dequant path is still the register-pressure source, and the `tl.interleave` rewrite still eliminates it — but on gfx1201 the original path only crosses the cliff at large `BLOCK_M`, so the speedup is smaller in magnitude despite the spill mechanism being identical.
 
 ---
 
