@@ -231,7 +231,7 @@ def fused_moe_kernel_gptq_awq(
         )
 
     if has_zp and use_int4_w4a16 and not use_int4_interleave:
-        b_zp_shifter = (offs_bn[None, :] % 2) * 4
+        b_zp_shifter = (offs_bn % 2) * 4
 
     # -----------------------------------------------------------
     # Iterate to compute a block of the C matrix.
@@ -242,13 +242,6 @@ def fused_moe_kernel_gptq_awq(
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
-
-        if not block_k_diviable:
-            k_mask = offs_k[:, None] < K - k * BLOCK_SIZE_K
-            k_other = 0.0
-        else:
-            k_mask = None
-            k_other = None
 
         a = tl.load(
             a_ptrs,
@@ -266,16 +259,17 @@ def fused_moe_kernel_gptq_awq(
                 b = tl.interleave(b, b)
             b = (b >> b_shifter) & 0xF
 
-        g_idx = (offs_k[:, None] + BLOCK_SIZE_K * k) // group_size
+        # Scalar group index: BLOCK_SIZE_K is clamped <= group_size at
+        # launch, so all rows in this tile share the same scale/zp group.
+        g_idx = (BLOCK_SIZE_K * k) // group_size
 
         b_scale_ptrs = (
             b_scale_ptr
             + off_experts * stride_bse
             + g_idx * stride_bsk
-            + offs_bn[None, :] * stride_bsn
+            + offs_bn * stride_bsn
         )
-        b_scale = tl.load(b_scale_ptrs, mask=k_mask, other=k_other)
-        b_scale = b_scale.to(tl.float32)
+        b_scale = tl.load(b_scale_ptrs).to(tl.float32)
 
         # Load or set zero points
         if has_zp:
@@ -284,25 +278,26 @@ def fused_moe_kernel_gptq_awq(
                 b_zp_ptrs = (
                     b_zp_ptr
                     + off_experts * stride_bze
-                    + (offs_bn[None, :] // 2) * stride_bzn
+                    + (offs_bn // 2) * stride_bzn
                     + g_idx * stride_bzk
                 )
-                b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
+                b_zp = tl.load(b_zp_ptrs)
                 b_zp = (b_zp >> b_zp_shifter) & 0xF
+                b_zp = b_zp.to(tl.float32)
             else:
                 b_zp_ptrs = (
                     b_zp_ptr
                     + off_experts * stride_bze
-                    + offs_bn[None, :] * stride_bzn
+                    + offs_bn * stride_bzn
                     + g_idx * stride_bzk
                 )
-                b_zp = tl.load(b_zp_ptrs, mask=k_mask, other=k_other)
+                b_zp = tl.load(b_zp_ptrs).to(tl.float32)
         else:
             # Symmetric quantization
             if use_int4_w4a16:
-                b_zp = 8
+                b_zp = 8.0
             elif use_int8_w8a16:
-                b_zp = 128
+                b_zp = 128.0
 
         # Dequantize: (weight - zero_point) * scale
         b = ((b.to(tl.float32) - b_zp) * b_scale).to(compute_type)
@@ -732,6 +727,15 @@ def invoke_fused_moe_wna16_triton_kernel(
             "Interleave path requires BLOCK_SIZE_N divisible by 8, "
             f"got {config['BLOCK_SIZE_N']}"
         )
+
+    # Clamp BLOCK_SIZE_K so each tile spans at most one scale/zp group,
+    # enabling scalar g_idx inside the kernel (same as dense triton_w4a16).
+    if block_shape[1] < config["BLOCK_SIZE_K"]:
+        config["BLOCK_SIZE_K"] = block_shape[1]
+    assert block_shape[1] % config["BLOCK_SIZE_K"] == 0, (
+        f"group_size ({block_shape[1]}) must be divisible by "
+        f"BLOCK_SIZE_K ({config['BLOCK_SIZE_K']})"
+    )
 
     fused_moe_kernel_gptq_awq[grid](
         A,
