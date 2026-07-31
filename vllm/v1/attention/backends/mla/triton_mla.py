@@ -24,7 +24,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
     MultipleOf,
 )
-from vllm.v1.attention.ops.triton_decode_attention import decode_attention_fwd
+from vllm.v1.attention.ops.rocm_aiter_mla_hybrid import mla_decode_hybrid
 from vllm.v1.worker.workspace import (
     current_workspace_manager,
     is_workspace_manager_initialized,
@@ -261,26 +261,27 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
         # Add a head dim of 1
         kv_c_and_k_pe_cache = kv_c_and_k_pe_cache.unsqueeze(2)
-        kv_c_cache = kv_c_and_k_pe_cache[..., : self.kv_lora_rank]
         PAGE_SIZE = kv_c_and_k_pe_cache.size(1)
 
-        # Run MQA — always pass layer scales. When KV cache is
-        # BF16 the kernel's `if dtype.is_fp8()` check is a no-op.
-        decode_attention_fwd(
+        # Hybrid dispatch: aiter's Triton kernel at large batch, in-tree kernel
+        # otherwise. The batch branch is inside a custom op so torch.compile
+        # keeps it a runtime decision. Always pass layer scales; for BF16 KV the
+        # in-tree kernel's `if dtype.is_fp8()` check is a no-op.
+        mla_decode_hybrid(
             q,
             kv_c_and_k_pe_cache,
-            kv_c_cache,
             o,
             lse,
+            attn_logits,
             attn_metadata.decode.block_table,
             attn_metadata.decode.seq_lens,
-            attn_logits,
+            layer._k_scale,
+            layer._k_scale,
             num_kv_splits,
             self.scale,
             PAGE_SIZE,
-            k_scale=layer._k_scale,
-            v_scale=layer._k_scale,
-            is_mla=True,
+            self.kv_lora_rank,
+            attn_metadata.max_seq_len,
         )
 
         return o, lse
