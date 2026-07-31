@@ -18,6 +18,9 @@ Target model: GLM-4.7-Flash (20 attn heads, `kv_lora_rank=512`,
 - Root cause of the in-tree cliff: vLLM's `num_kv_splits` heuristic ignores
   batch·heads, so at high load it over-splits and the stage-2 reduce becomes
   bandwidth-bound (≈336 MB partial-logits scratch at B=256).
+- Wired into a hybrid PoC (aiter at `B≥32`, in-tree otherwise) and validated end
+  to end on GLM-4.7-Flash TP4: **~11% throughput** over baseline. Default batch
+  threshold chosen from an end-to-end sweep (see below).
 
 ## Context vs vLLM (very brief)
 
@@ -80,6 +83,44 @@ match; the two kernels compute the same thing.
 
 Swept H∈{5,20}, seq∈{2048,8192,16384}, B∈{1,8,32,64,128,256}, page=16.
 
+## End-to-end validation (hybrid PoC)
+
+The hybrid dispatch (`vllm/v1/attention/ops/rocm_aiter_mla_hybrid.py`: aiter's
+Triton `mla_decode_fwd` at `B >= VLLM_MLA_AITER_MIN_BATCH`, in-tree otherwise,
+wrapped in a custom op so torch.compile keeps the branch a runtime decision) was
+run end to end on GLM-4.7-Flash, TP4, gfx1100: `vllm bench throughput`, 1000
+ShareGPT prompts, `--max-model-len 4096`, bf16, `--gpu-memory-utilization 0.8`.
+Baseline is clean `main` (in-tree only). Both baseline and PoC ran on a fresh
+`torch.compile` (stale AOT artifact cleared first, cf. the box notes).
+
+Threshold sweep (`VLLM_MLA_AITER_MIN_BATCH`; aiter confirmed engaged on all 4
+ranks via the "loaded aiter mla_decode_fwd (min_batch=N)" log):
+
+| Threshold | Requests/s | Total tok/s | Output tok/s | vs baseline |
+|---|---|---|---|---|
+| baseline (in-tree) | 8.89 | 3681.53 | 1776.12 | 1.00× |
+| B ≥ 128 | 9.58 | 3969.22 | 1914.92 | 1.078× |
+| B ≥ 64 | 9.75 | 4040.73 | 1949.41 | 1.097× |
+| B ≥ 32 | 9.85 | 4080.89 | 1968.79 | 1.108× |
+| B ≥ 16 | 9.89 | 4096.08 | 1976.12 | 1.112× |
+| B ≥ 8 | 9.74 | 4037.20 | 1947.71 | 1.096× |
+
+Reading:
+
+- **~11% end-to-end** at the best threshold — far below the per-kernel peak
+  (~3.4×) because MLA decode is only a fraction of each step (MoE GEMMs +
+  collectives dominate GLM decode on this box) and the aiter branch only fires
+  on the large-batch steps.
+- **The optimum is a flat 16–64 plateau** (9.75–9.89; the spread is run-to-run
+  noise). The clear signal is that every threshold ≤64 beats `B≥128` by ~2–3% —
+  the old 128 default left the whole mid-batch win band on the in-tree kernel.
+- **Below 16 it regresses** (B≥8 → 9.74): routing B≤8 steps to aiter, where it
+  loses per-kernel, drags the aggregate down. The end-to-end optimum sits right
+  at the per-kernel crossover.
+- **Default is now 32** — on the plateau and inside the microbench-confirmed win
+  regime (B=32 is a measured 1.1–1.5× per-kernel), a more robust choice than the
+  noise-level 16 peak.
+
 ## Root cause of the high-batch gap
 
 vLLM's split count is chosen from sequence length and CU count only:
@@ -104,7 +145,11 @@ so aiter's extra machinery just adds overhead and it loses.
    `B·H` so splits back off once the machine is already full). Likely captures
    much of aiter's high-batch win with no new dependency or integration.
 2. **Wire aiter #3 behind a batch gate:** dispatch to aiter's Triton
-   `mla_decode_fwd` only when B is large, keeping in-tree for low batch. More
-   integration cost; only worth it if (1) leaves gains on the table.
+   `mla_decode_fwd` only when B is large, keeping in-tree for low batch. Done as
+   the hybrid PoC (`rocm_aiter_mla_hybrid.py`) and validated end to end (see
+   above): ~11% throughput at `B≥32`, aiter engaged and captured cleanly. Not
+   upstream-ready — hard aiter dependency, dev-tree import fallback, PoC-local
+   `os.getenv` knob (not in `vllm/envs.py`), no LSE from the aiter branch (must
+   not be used with decode context parallelism).
 
 Backends #1 and #2 are dead ends on RDNA (precompiled MI-only; stale vLLM fork).

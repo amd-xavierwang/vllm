@@ -28,8 +28,10 @@ from vllm.v1.attention.ops.triton_decode_attention import decode_attention_fwd
 logger = init_logger(__name__)
 
 # Batch at/above which the aiter kernel is used. gfx1100 microbenchmark: aiter
-# wins ~1.1-1.5x from B>=32 and ~3x from B>=128; keep the conservative default.
-VLLM_MLA_AITER_MIN_BATCH = int(os.getenv("VLLM_MLA_AITER_MIN_BATCH", "128"))
+# wins ~1.1-1.5x from B>=32 and ~3x from B>=128. End-to-end GLM-4.7-Flash sweep
+# (TP4) puts the optimum on a flat 16-64 plateau; 32 sits on that plateau in the
+# microbench-confirmed win regime and beats the old B>=128 default by ~3%.
+VLLM_MLA_AITER_MIN_BATCH = int(os.getenv("VLLM_MLA_AITER_MIN_BATCH", "32"))
 
 _AITER_MLA_DECODE_FWD = None
 _AITER_LOAD_ATTEMPTED = False
