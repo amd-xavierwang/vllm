@@ -1363,6 +1363,20 @@ def get_default_config(
             config = {"BLOCK_SIZE_M": 32, "GROUP_SIZE_M": 1, "SPLIT_K": 1}
         else:
             config = {"BLOCK_SIZE_M": 64, "GROUP_SIZE_M": 1, "SPLIT_K": 1}
+        if current_platform.is_rocm() and dtype == "int4_w4a16":
+            from vllm.platforms.rocm import on_rdna4
+
+            # A 64-row M tile with the default 4 warps overflows the RDNA4 VGPR
+            # file for fp16 asymmetric int4 (in-kernel zero-point unpack) and
+            # spills to scratch. Keep the 32-row tile through mid-size batches
+            # where it stays register-resident and is fastest; larger batches
+            # need the 64-row tile for throughput but avoid the spill with more
+            # warps.
+            if on_rdna4():
+                if M <= 256:
+                    config["BLOCK_SIZE_M"] = 32
+                else:
+                    config["num_warps"] = 8
     else:
         # General defaults for bf16/fp16 and fp8 per-tensor.
         # Tile sizes scale with batch: small batches are memory-bound
