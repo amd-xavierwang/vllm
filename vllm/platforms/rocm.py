@@ -295,6 +295,12 @@ def on_gfx1x() -> bool:
     return _ON_GFX1X
 
 
+def on_rdna() -> bool:
+    # RDNA family relevant to us: gfx11 (RDNA3) and gfx12 (RDNA4). Mirrors
+    # _ON_GFX1X; kept as a named helper so backend gating reads intently.
+    return _ON_GFX1X
+
+
 def on_gfx11() -> bool:
     return _ON_GFX11
 
@@ -404,6 +410,32 @@ def flash_attn_triton_available() -> bool:
         return False
 
 
+def _use_aiter_mla_decode() -> bool:
+    """Gate for the RDNA aiter Triton MLA decode backend.
+
+    Enabled only when:
+      * the GPU is RDNA (gfx11/gfx12) -- ``on_rdna()``;
+      * aiter's Triton MLA decode kernel is importable; and
+      * decode context parallelism is disabled. The aiter kernel drops the LSE,
+        so it cannot merge partial decode outputs across context-parallel ranks.
+    """
+    if not on_rdna():
+        return False
+
+    from importlib.util import find_spec
+
+    if find_spec("aiter.ops.triton.attention.mla") is None:
+        return False
+
+    from vllm.config import get_current_vllm_config_or_none
+
+    vllm_config = get_current_vllm_config_or_none()
+    return not (
+        vllm_config is not None
+        and vllm_config.parallel_config.decode_context_parallel_size > 1
+    )
+
+
 def _get_backend_priorities(
     use_mla: bool,
     use_sparse: bool,
@@ -415,16 +447,19 @@ def _get_backend_priorities(
         return [AttentionBackendEnum.ROCM_AITER_MLA_SPARSE]
 
     if use_mla:
+        backends: list[AttentionBackendEnum] = []
+        # Prefer aiter's RDNA-tuned Triton decode kernel when available.
+        if _use_aiter_mla_decode():
+            backends.append(AttentionBackendEnum.ROCM_AITER_MLA_DECODE)
         if rocm_aiter_ops.is_mla_enabled():
-            return [
+            backends += [
                 AttentionBackendEnum.ROCM_AITER_MLA,
                 AttentionBackendEnum.TRITON_MLA,
                 AttentionBackendEnum.ROCM_AITER_TRITON_MLA,
             ]
         else:
-            return [
-                AttentionBackendEnum.TRITON_MLA,
-            ]
+            backends.append(AttentionBackendEnum.TRITON_MLA)
+        return backends
 
     backends = []
     # Keep ROCM_ATTN disabled for KV connectors until connector transfer
