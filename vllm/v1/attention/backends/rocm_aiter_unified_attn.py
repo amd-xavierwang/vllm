@@ -83,8 +83,7 @@ class RocmAiterUnifiedAttentionBackend(RocmAttentionBackend):
 
     @classmethod
     def supports_mm_prefix(cls) -> bool:
-        # Not implemented
-        return False
+        return True
 
     @classmethod
     def supports_sink(cls) -> bool:
@@ -294,6 +293,10 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
                 v_descale=layer._v_scale,
                 sinks=self.sinks,
                 output_scale=output_scale,
+                mm_prefix_range=attn_metadata.mm_prefix_range_tensor,
+                mm_prefix_clamp_sliding_window=getattr(
+                    layer, "mm_prefix_clamp_sliding_window", False
+                ),
             )
         else:
             # The aiter kernel is causal-only. Non-causal cross-attention

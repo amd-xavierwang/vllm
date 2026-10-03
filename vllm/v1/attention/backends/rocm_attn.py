@@ -27,6 +27,7 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
     MultipleOf,
 )
+from vllm.v1.attention.backends.utils import compute_mm_prefix_range_tensor
 from vllm.v1.attention.ops.chunked_prefill_paged_decode import (
     chunked_prefill_paged_decode,
     has_native_kv_cache_layout,
@@ -71,6 +72,9 @@ class RocmAttentionMetadata:
 
     # DFlash drafting sets this to False via CommonAttentionMetadata.
     causal: bool = True
+
+    # [num_reqs, max_ranges, 2] inclusive spans that attend bidirectionally.
+    mm_prefix_range_tensor: torch.Tensor | None = None
 
 
 class RocmAttentionMetadataBuilder(AttentionMetadataBuilder[RocmAttentionMetadata]):
@@ -157,6 +161,12 @@ class RocmAttentionMetadataBuilder(AttentionMetadataBuilder[RocmAttentionMetadat
             prefix_scheduler_metadata=prefix_scheduler_metadata,
             causal=common_attn_metadata.causal,
         )
+
+        mm_ranges = common_attn_metadata.mm_req_doc_ranges
+        if mm_ranges is not None:
+            attn_metadata.mm_prefix_range_tensor = compute_mm_prefix_range_tensor(
+                mm_ranges, common_attn_metadata.num_reqs, seq_lens.device
+            )
         return attn_metadata
 
 
