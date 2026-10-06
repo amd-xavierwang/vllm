@@ -1888,6 +1888,10 @@ if current_platform.is_rocm():
         for x in NON_CAUSAL_BACKENDS_TO_TEST
         if x is not AttentionBackendEnum.FLASH_ATTN
     ]
+    from vllm._aiter_ops import IS_AITER_FOUND
+
+    if IS_AITER_FOUND:
+        NON_CAUSAL_BACKENDS_TO_TEST.append(AttentionBackendEnum.ROCM_AITER_UNIFIED_ATTN)
 
 
 @pytest.mark.parametrize(
